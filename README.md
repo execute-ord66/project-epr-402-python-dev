@@ -1,1 +1,3 @@
 # project-epr-402-python-dev
+
+Python implementation for training, validating, and showcasing the Multi-f0 Estimation model for a cappella performances. The implementation is a modified version of *MULTIPLE F0 ESTIMATION IN VOCAL ENSEMBLES USING CONVOLUTIONAL NEURAL NETWORKS* (Helena Cuesta, Brian McFee, Emilia Gómez), utilising an approximation of the HCQT rather than the expensive but exact computation. The model is trained using PyTorch. All pre-processing and post-processing steps are implemented using librosa and implemented from first principles using NumPy.
