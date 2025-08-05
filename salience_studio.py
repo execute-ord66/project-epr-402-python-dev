@@ -44,9 +44,6 @@ def get_default_config():
             "bins_per_octave": 60, "n_octaves": 6, "gaussian_sigma": 1.0,
             "train_dataset": "Cantoria", "eval_dataset": "DCS",
         },
-        "augmentation_params": {
-            "pitch_shift_max_semitones": 2, "pitch_shift_prob": 0.5, "stem_drop_prob": 0.25,
-        },
         "model_params": {
             "architecture_name": "SalienceNetV1", "input_channels": 5,
             "layers": [
@@ -230,12 +227,11 @@ class DataProcessor:
 class PatchDataset(Dataset):
     """
     Creates patches from pre-computed and cached CQT/F0 maps of full track groups.
-    The only on-the-fly augmentation is pitch shifting.
     """
     def __init__(self, track_groups, root_dir, cache_dir, config, is_train, log_callback):
         self.config, self.is_train = config, is_train
         self.log = log_callback
-        self.ap = self.config.get('augmentation_params', {})
+
         self.tp, self.dp = self.config['training_params'], self.config['data_params']
         self.patch_width_frames = self.tp['patch_width']
         self.step_size = int(self.patch_width_frames * (1 - self.tp['patch_overlap']))
@@ -276,14 +272,6 @@ class PatchDataset(Dataset):
         end_frame = start_frame + self.patch_width_frames
         cqt_patch = hcqt_full[:, :, start_frame:end_frame]
         f0_patch = f0_map_full[:, start_frame:end_frame]
-
-        # --- ON-THE-FLY PITCH SHIFT AUGMENTATION ---
-        if self.is_train and 'pitch_shift_prob' in self.ap and random.random() < self.ap['pitch_shift_prob']:
-            semitones = random.randint(-self.ap['pitch_shift_max_semitones'], self.ap['pitch_shift_max_semitones'])
-            if semitones != 0:
-                bins_to_shift = int(semitones * self.dp['bins_per_octave'] / 12)
-                cqt_patch = np.roll(cqt_patch, bins_to_shift, axis=1)
-                f0_patch = np.roll(f0_patch, bins_to_shift, axis=0)
         
         return torch.from_numpy(cqt_patch.copy()).float(), torch.from_numpy(f0_patch.copy()).unsqueeze(0).float()
 
@@ -638,7 +626,6 @@ class HyperparameterTuner:
         # Create a temporary config for this evaluation run
         eval_config = self.base_config.copy()
         eval_config['training_params']['learning_rate'] = individual_params['learning_rate']
-        eval_config['augmentation_params']['stem_drop_prob'] = individual_params['stem_drop_prob']
         eval_config['data_params']['gaussian_sigma'] = individual_params['gaussian_sigma']
         eval_config['training_params']['num_epochs'] = self.tuning_params['epochs_per_eval']
         
@@ -783,14 +770,6 @@ class SalienceStudioApp(ctk.CTk):
         ctk.CTkLabel(settings_frame, text="Batch Size").pack(anchor="w", padx=10, pady=(10,0))
         self.train_widgets['batch_size'] = ctk.CTkEntry(settings_frame, placeholder_text=str(self.config['training_params']['batch_size']))
         self.train_widgets['batch_size'].pack(fill="x", padx=10)
-
-        # --- Augmentation Parameters ---
-        ctk.CTkLabel(settings_frame, text="Augmentation", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(20,0))
-        
-        ctk.CTkLabel(settings_frame, text=f"Pitch Shift Probability ({self.config['augmentation_params']['pitch_shift_prob']:.2f})").pack(anchor="w", padx=10, pady=(10,0))
-        self.train_widgets['pitch_shift_prob'] = ctk.CTkSlider(settings_frame, from_=0.0, to=1.0, number_of_steps=20)
-        self.train_widgets['pitch_shift_prob'].set(self.config['augmentation_params']['pitch_shift_prob'])
-        self.train_widgets['pitch_shift_prob'].pack(fill="x", padx=10)
 
         # --- Control Buttons and Progress Bar ---
         self.train_button = ctk.CTkButton(tab, text="Start Training", command=self.start_training_thread)
@@ -1044,9 +1023,6 @@ class SalienceStudioApp(ctk.CTk):
         except (ValueError, TypeError): pass
         try: self.config['training_params']['batch_size'] = int(self.train_widgets['batch_size'].get())
         except (ValueError, TypeError): pass
-
-        # Augmentation Params
-        self.config['augmentation_params']['pitch_shift_prob'] = self.train_widgets['pitch_shift_prob'].get()
         
         self.log("Configuration updated from UI settings.")
     
