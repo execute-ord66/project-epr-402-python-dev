@@ -5,6 +5,7 @@ __pycache__/
 *_test.*
 cache/
 test?.wav
+checkpoints
 
 # C extensions
 *.so

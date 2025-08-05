@@ -1,16 +1,3 @@
-# -----------------------------------------------------------------------------
-# Deep Salience Studio: All-in-One Training and Evaluation Tool
-# -----------------------------------------------------------------------------
-# Author: Gemini
-# Date: August 6, 2025
-#
-# Description:
-# A comprehensive, single-file application for training, evaluating, and tuning
-# deep learning models for polyphonic pitch estimation. It features a fully
-# functional UI with data augmentation, a dynamic model, a complete training
-# and evaluation pipeline, and a genetic algorithm for hyper-parameter tuning.
-# -----------------------------------------------------------------------------
-
 import os
 import sys
 import json
@@ -84,7 +71,6 @@ def get_default_config():
             "crossover_rate": 0.7,
             "search_space": {
                 "learning_rate": {"type": "log_uniform", "range": [1e-5, 1e-3]},
-                "stem_drop_prob": {"type": "uniform", "range": [0.0, 0.5]},
                 "gaussian_sigma": {"type": "uniform", "range": [0.5, 2.0]},
             }
         }
@@ -143,178 +129,155 @@ def calculate_f1_score(ref_times, ref_freqs, est_times, est_freqs):
 # -----------------------------------------------------------------------------
 
 class DataProcessor:
+    """
+    Processes a group of tracks into a cached CQT/F0 representation for the entire mix.
+    """
     def __init__(self, config, root_dir, cache_dir, log_callback):
         self.config, self.root_dir, self.cache_dir = config, root_dir, cache_dir
-        self.dp, self.ap = self.config['data_params'], self.config.get('augmentation_params', {})
+        self.dp = self.config['data_params']
         self.n_bins = self.dp['n_octaves'] * self.dp['bins_per_octave']
         self.log = log_callback
 
-    # In the DataProcessor class
-
     def get_dataset_folder(self, stem_name):
         """Finds the correct dataset subfolder (e.g., 'Cantoria', 'DCS') for a given stem."""
-        
-        # Determine the dataset type from the stem name
         is_cantoria = stem_name.lower().startswith("cantoria")
         is_dcs = stem_name.lower().startswith("dcs")
-
-        # Find the corresponding folder in the root directory
         try:
             for folder_name in os.listdir(self.root_dir):
-                # Check if the folder is a directory
-                if not os.path.isdir(os.path.join(self.root_dir, folder_name)):
-                    continue
-                
+                if not os.path.isdir(os.path.join(self.root_dir, folder_name)): continue
                 lower_folder_name = folder_name.lower()
-                if is_cantoria and "cantoria" in lower_folder_name:
-                    return folder_name
-                if is_dcs and ("dcs" in lower_folder_name or "dagstuhl" in lower_folder_name):
-                    return folder_name
-        except FileNotFoundError:
-            # This case should ideally not be reached if the discovery worked
-            pass
-        
-        # Fallback or error
-        self.log(f"Warning: Could not determine dataset folder for stem '{stem_name}'. Returning empty string.")
-        return "" # Return empty string to make path invalid, preventing silent errors
+                if is_cantoria and "cantoria" in lower_folder_name: return folder_name
+                if is_dcs and ("dcs" in lower_folder_name or "dagstuhl" in lower_folder_name): return folder_name
+        except FileNotFoundError: pass
+        self.log(f"Warning: Could not determine dataset folder for stem '{stem_name}'.")
+        return ""
 
-    # In the DataProcessor class
-
-    def process_and_cache_stem(self, stem):
-        """Processes and caches a SINGLE stem."""
-        cache_fname = f"{stem}.npz"
+    def process_and_cache_group(self, track_stems):
+        """Processes and caches an entire group of stems as a single mix."""
+        # The cache filename is based on the sorted list of stems in the group
+        cache_fname = "_".join(sorted(track_stems)) + ".npz"
         cache_path = os.path.join(self.cache_dir, cache_fname)
         if os.path.exists(cache_path):
             return cache_path
 
-        self.log(f"Processing & Caching Individual Stem: {stem}")
-        dataset_folder = self.get_dataset_folder(stem)
-        if not dataset_folder:
-            self.log(f"  - ERROR: Could not find dataset folder for stem {stem}. Cannot cache.")
-            return None
+        self.log(f"Processing & Caching Group: {', '.join(track_stems)}")
 
-        base_path = os.path.join(self.root_dir, dataset_folder)
-        audio_path = os.path.join(base_path, "Audio", f"{stem}.wav")
-        crepe_path = os.path.join(base_path, "F0_crepe", f"{stem}.csv")
-        pyin_path = os.path.join(base_path, "F0_pyin", f"{stem}.csv")
+        # --- AUDIO MIXING ---
+        max_len, all_y = 0, []
+        for stem in track_stems:
+            dataset_folder = self.get_dataset_folder(stem)
+            audio_path = os.path.join(self.root_dir, dataset_folder, "Audio", f"{stem}.wav")
+            y, _ = librosa.load(audio_path, sr=self.dp['sr'])
+            all_y.append(y)
+            if len(y) > max_len: max_len = len(y)
         
-        if not all(os.path.exists(p) for p in [audio_path, crepe_path, pyin_path]):
-            self.log(f"  - ERROR: Missing files for stem {stem}. Cannot cache.")
-            return None
+        y_mix = np.sum([np.pad(y, (0, max_len - len(y))) for y in all_y], axis=0)
+        if np.max(np.abs(y_mix)) > 0:
+            y_mix /= np.max(np.abs(y_mix))
 
-        y, _ = librosa.load(audio_path, sr=self.dp['sr'])
-
-        # --- HCQT Calculation for single stem ---
-        cqt_list = [librosa.cqt(y, sr=self.dp['sr'], hop_length=self.dp['hop_length'], fmin=self.dp['fmin'] * h, n_bins=self.n_bins, bins_per_octave=self.dp['bins_per_octave']) for h in self.dp['harmonics']]
+        # --- HCQT CALCULATION for the full mix ---
+        cqt_list = [librosa.cqt(y_mix, sr=self.dp['sr'], hop_length=self.dp['hop_length'], fmin=self.dp['fmin'] * h, n_bins=self.n_bins, bins_per_octave=self.dp['bins_per_octave']) for h in self.dp['harmonics']]
         min_time = min(c.shape[1] for c in cqt_list)
-        # We cache the raw complex CQT to mix them before taking abs/log
-        hcqt_complex = np.stack([c[:, :min_time] for c in cqt_list])
+        hcqt = np.stack([c[:, :min_time] for c in cqt_list])
+        log_hcqt = (1.0/80.0) * librosa.amplitude_to_db(np.abs(hcqt), ref=np.max) + 1.0
 
-        # --- Ground Truth F0 Map for single stem ---
-        n_frames = hcqt_complex.shape[2]
+        # --- GROUND TRUTH F0 MAP (ROBUST VERSION) ---
+        n_frames = log_hcqt.shape[2]
         frame_times = librosa.frames_to_time(np.arange(n_frames), sr=self.dp['sr'], hop_length=self.dp['hop_length'])
         cq_freqs = librosa.cqt_frequencies(n_bins=self.n_bins, fmin=self.dp['fmin'], bins_per_octave=self.dp['bins_per_octave'])
         f0_map = np.zeros((self.n_bins, n_frames), dtype=np.float32)
+        total_active_frames = 0
 
-        crepe_df = pd.read_csv(crepe_path); crepe_df.columns = [c.strip() for c in crepe_df.columns]
-        pyin_df = pd.read_csv(pyin_path, header=None, names=['time', 'frequency', 'confidence'])
-        interp_freqs = np.interp(frame_times, crepe_df['time'], crepe_df['frequency'], left=0, right=0)
-        pyin_voiced_mask = (pyin_df['frequency'] > 0).astype(float)
-        interp_voiced = np.interp(frame_times, pyin_df['time'], pyin_voiced_mask, left=0, right=0)
-        active_mask = (interp_freqs >= self.dp['fmin']) & (interp_voiced > 0.5)
+        for stem in track_stems:
+            dataset_folder = self.get_dataset_folder(stem)
+            if not dataset_folder: continue
 
-        if np.any(active_mask):
-            frame_idxs = np.where(active_mask)[0]
-            bin_idxs = np.argmin(np.abs(interp_freqs[active_mask, None] - cq_freqs[None, :]), axis=1)
-            f0_map[bin_idxs, frame_idxs] = 1.0
+            base_path = os.path.join(self.root_dir, dataset_folder)
+            crepe_path = os.path.join(base_path, "F0_crepe", f"{stem}.csv")
+            pyin_path = os.path.join(base_path, "F0_pyin", f"{stem}.csv")
+            if not os.path.exists(crepe_path) or not os.path.exists(pyin_path): continue
+
+            crepe_df = pd.read_csv(crepe_path)
+            crepe_df.columns = [c.strip() for c in crepe_df.columns]
+            pyin_df = pd.read_csv(pyin_path, header=None, names=['time', 'frequency', 'confidence'])
+            
+            interp_freqs = np.interp(frame_times, crepe_df['time'], crepe_df['frequency'], left=0, right=0)
+            pyin_voiced_mask = (pyin_df['frequency'] > 0).astype(float)
+            interp_voiced = np.interp(frame_times, pyin_df['time'], pyin_voiced_mask, left=0, right=0)
+            
+            active_mask = (interp_freqs >= self.dp['fmin']) & (interp_voiced > 0.5)
+            
+            num_active_for_stem = np.sum(active_mask)
+            if num_active_for_stem > 0:
+                total_active_frames += num_active_for_stem
+                frame_idxs = np.where(active_mask)[0]
+                bin_idxs = np.argmin(np.abs(interp_freqs[active_mask, None] - cq_freqs[None, :]), axis=1)
+                f0_map[bin_idxs, frame_idxs] = 1.0
         
-        # We don't apply gaussian filter until after mixing the f0 maps
-        np.savez_compressed(cache_path, hcqt_complex=hcqt_complex, f0_map=f0_map)
-        return cache_path
+        if total_active_frames == 0:
+            self.log(f"  - WARNING: No active frames found for this group. Ground truth will be all zeros.")
+        else:
+            self.log(f"  - Found {total_active_frames} active pitch frames for this group.")
 
-class PatchDataset(Dataset):
-    def __init__(self, track_groups, root_dir, cache_dir, config, is_train, log_callback):
-        self.config, self.is_train = config, is_train
-        self.ap = self.config.get('augmentation_params', {})
-        self.tp, self.dp = self.config['training_params'], self.config['data_params']
-        self.patch_width, self.step_size = self.tp['patch_width'], int(self.tp['patch_width'] * (1 - self.tp['patch_overlap']))
-        
-        processor = DataProcessor(config, root_dir, cache_dir, log_callback)
-        
-        self.track_groups = track_groups
-        self.stem_data = {} # Caches data for every individual stem
-        max_len = 0
-
-        # Pre-cache and load all individual stems needed for this dataset split
-        all_stems = {stem for group in track_groups for stem in group}
-        for stem in all_stems:
-            cache_path = processor.process_and_cache_stem(stem)
-            if cache_path:
-                data = np.load(cache_path)
-                self.stem_data[stem] = {
-                    'hcqt_complex': data['hcqt_complex'],
-                    'f0_map': data['f0_map']
-                }
-                if data['hcqt_complex'].shape[2] > max_len:
-                    max_len = data['hcqt_complex'].shape[2]
-
-        # Determine the number of patches available
-        self.num_patches_per_track = (max_len - self.patch_width + 1) // self.step_size
-
-    def __len__(self):
-        # The length is now the number of groups * number of patches we can extract
-        # This gives a good epoch size.
-        return len(self.track_groups) * self.num_patches_per_track
-
-    def __getitem__(self, idx):
-        # Determine which group and which patch start to use
-        group_idx = idx // self.num_patches_per_track
-        patch_idx = idx % self.num_patches_per_track
-        
-        track_group = self.track_groups[group_idx]
-        start_frame = patch_idx * self.step_size
-
-        # --- ON-THE-FLY AUGMENTATION & MIXING ---
-        stems_to_process = list(track_group)
-        if self.is_train and 'stem_drop_prob' in self.ap and random.random() < self.ap['stem_drop_prob'] and len(stems_to_process) > 1:
-            stems_to_process.pop(random.randint(0, len(stems_to_process) - 1))
-
-        # Mix the pre-computed complex HCQTs
-        # We need to ensure all HCQTs are the same length before summing
-        max_len_group = max(self.stem_data[s]['hcqt_complex'].shape[2] for s in stems_to_process if s in self.stem_data)
-        
-        sum_hcqt_complex = np.zeros((len(self.dp['harmonics']), self.dp['n_octaves'] * self.dp['bins_per_octave'], max_len_group), dtype=np.complex64)
-        for stem in stems_to_process:
-            if stem in self.stem_data:
-                data = self.stem_data[stem]['hcqt_complex']
-                pad_width = max_len_group - data.shape[2]
-                padded_hcqt = np.pad(data, ((0,0), (0,0), (0, pad_width)))
-                sum_hcqt_complex += padded_hcqt
-        
-        # Now convert to log-magnitude
-        log_hcqt = (1.0/80.0) * librosa.amplitude_to_db(np.abs(sum_hcqt_complex), ref=np.max) + 1.0
-
-        # Mix the F0 maps from the *original* group
-        max_len_f0 = max(self.stem_data[s]['f0_map'].shape[1] for s in track_group if s in self.stem_data)
-        sum_f0_map = np.zeros((self.dp['n_octaves'] * self.dp['bins_per_octave'], max_len_f0), dtype=np.float32)
-        for stem in track_group: # Use original group for ground truth
-            if stem in self.stem_data:
-                data = self.stem_data[stem]['f0_map']
-                pad_width = max_len_f0 - data.shape[1]
-                padded_f0 = np.pad(data, ((0,0), (0, pad_width)))
-                sum_f0_map += padded_f0
-
-        # Apply gaussian filter and normalize the final summed F0 map
-        f0_map = gaussian_filter(sum_f0_map, sigma=(self.dp['gaussian_sigma'], 0), mode='constant')
+        # --- GAUSSIAN SMOOTHING & NORMALIZATION ---
+        f0_map = gaussian_filter(f0_map, sigma=(self.dp['gaussian_sigma'], 0), mode='constant')
         if f0_map.max() > 0:
             f0_map /= f0_map.max()
         
-        # --- EXTRACT PATCHES ---
-        end_frame = start_frame + self.patch_width
-        cqt_patch = log_hcqt[:, :, start_frame:end_frame]
-        f0_patch = f0_map[:, start_frame:end_frame]
+        np.savez_compressed(cache_path, log_hcqt=log_hcqt, f0_map=f0_map)
+        return cache_path
 
-        # --- ON-THE-FLY PITCH SHIFT ---
+class PatchDataset(Dataset):
+    """
+    Creates patches from pre-computed and cached CQT/F0 maps of full track groups.
+    The only on-the-fly augmentation is pitch shifting.
+    """
+    def __init__(self, track_groups, root_dir, cache_dir, config, is_train, log_callback):
+        self.config, self.is_train = config, is_train
+        self.log = log_callback
+        self.ap = self.config.get('augmentation_params', {})
+        self.tp, self.dp = self.config['training_params'], self.config['data_params']
+        self.patch_width_frames = self.tp['patch_width']
+        self.step_size = int(self.patch_width_frames * (1 - self.tp['patch_overlap']))
+
+        processor = DataProcessor(config, root_dir, cache_dir, log_callback)
+        
+        self.index = []
+        self.cache_data = []
+
+        for group in tqdm(track_groups, desc="Checking and loading cache", leave=False):
+            # The processor now takes the whole group
+            cache_path = processor.process_and_cache_group(group)
+            if cache_path:
+                # Load the data into memory once
+                data = np.load(cache_path)
+                self.cache_data.append({
+                    'log_hcqt': data['log_hcqt'],
+                    'f0_map': data['f0_map']
+                })
+                # Build the index to get patches from this data
+                n_frames = data['log_hcqt'].shape[2]
+                current_data_idx = len(self.cache_data) - 1
+                for start in range(0, n_frames - self.patch_width_frames + 1, self.step_size):
+                    self.index.append((current_data_idx, start))
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, idx):
+        # Retrieve the data index and start frame for the patch
+        data_idx, start_frame = self.index[idx]
+        
+        # Get the pre-loaded data
+        hcqt_full = self.cache_data[data_idx]['log_hcqt']
+        f0_map_full = self.cache_data[data_idx]['f0_map']
+
+        # Slice the patch
+        end_frame = start_frame + self.patch_width_frames
+        cqt_patch = hcqt_full[:, :, start_frame:end_frame]
+        f0_patch = f0_map_full[:, start_frame:end_frame]
+
+        # --- ON-THE-FLY PITCH SHIFT AUGMENTATION ---
         if self.is_train and 'pitch_shift_prob' in self.ap and random.random() < self.ap['pitch_shift_prob']:
             semitones = random.randint(-self.ap['pitch_shift_max_semitones'], self.ap['pitch_shift_max_semitones'])
             if semitones != 0:
@@ -322,7 +285,7 @@ class PatchDataset(Dataset):
                 cqt_patch = np.roll(cqt_patch, bins_to_shift, axis=1)
                 f0_patch = np.roll(f0_patch, bins_to_shift, axis=0)
         
-        return torch.from_numpy(cqt_patch).float(), torch.from_numpy(f0_patch).unsqueeze(0).float()
+        return torch.from_numpy(cqt_patch.copy()).float(), torch.from_numpy(f0_patch.copy()).unsqueeze(0).float()
 
 class DatasetManager:
     def __init__(self, root_dir, cache_dir, log_callback=print):
@@ -823,11 +786,6 @@ class SalienceStudioApp(ctk.CTk):
 
         # --- Augmentation Parameters ---
         ctk.CTkLabel(settings_frame, text="Augmentation", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(20,0))
-
-        ctk.CTkLabel(settings_frame, text=f"Stem Drop Probability ({self.config['augmentation_params']['stem_drop_prob']:.2f})").pack(anchor="w", padx=10)
-        self.train_widgets['stem_drop_prob'] = ctk.CTkSlider(settings_frame, from_=0.0, to=1.0, number_of_steps=20)
-        self.train_widgets['stem_drop_prob'].set(self.config['augmentation_params']['stem_drop_prob'])
-        self.train_widgets['stem_drop_prob'].pack(fill="x", padx=10)
         
         ctk.CTkLabel(settings_frame, text=f"Pitch Shift Probability ({self.config['augmentation_params']['pitch_shift_prob']:.2f})").pack(anchor="w", padx=10, pady=(10,0))
         self.train_widgets['pitch_shift_prob'] = ctk.CTkSlider(settings_frame, from_=0.0, to=1.0, number_of_steps=20)
@@ -1088,7 +1046,6 @@ class SalienceStudioApp(ctk.CTk):
         except (ValueError, TypeError): pass
 
         # Augmentation Params
-        self.config['augmentation_params']['stem_drop_prob'] = self.train_widgets['stem_drop_prob'].get()
         self.config['augmentation_params']['pitch_shift_prob'] = self.train_widgets['pitch_shift_prob'].get()
         
         self.log("Configuration updated from UI settings.")
