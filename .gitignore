@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*_test.*
+cache/
+test?.wav
 
 # C extensions
 *.so
