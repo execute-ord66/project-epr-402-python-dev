@@ -26,7 +26,7 @@ from scipy.ndimage import gaussian_filter
 from scipy.signal import find_peaks
 import mir_eval
 import customtkinter as ctk
-import hashlib # Make sure this is imported at the top
+import hashlib 
 
 # Use the 'Agg' backend for Matplotlib to make it thread-safe for Tkinter
 matplotlib.use('Agg')
@@ -45,7 +45,8 @@ def get_default_config():
             "train_dataset": "Cantoria", "eval_dataset": "DCS",
         },
         "model_params": {
-            "architecture_name": "SalienceNetV1", "input_channels": 5,
+            "architecture_name": "SalienceNetV1",
+            "input_channels": 5, # Should match len(harmonics)
             "layers": [
                 {"type": "conv", "filters": 32, "kernel": 5, "padding": 2},
                 {"type": "conv", "filters": 32, "kernel": 5, "padding": 2},
@@ -56,19 +57,23 @@ def get_default_config():
             ], "activation": "GELU"
         },
         "training_params": {
-            "learning_rate": 1e-4, "batch_size": 16, "num_epochs": 10,
+            "learning_rate": 1e-3, "batch_size": 32, "num_epochs": 30,
             "optimizer": "AdamW", "patch_width": 50, "patch_overlap": 0.5, "val_split_ratio": 0.15,
         },
         "evaluation_params": {"eval_batch_size": 8, "peak_threshold": 0.3},
         "tuning_params": {
             "population_size": 8,
             "num_generations": 5,
-            "epochs_per_eval": 3, # Num epochs to train each individual for fitness
+            "epochs_per_eval": 5,
             "mutation_rate": 0.2,
             "crossover_rate": 0.7,
+            # Fitness function weights
+            "fitness_performance_weight": 0.8, # w1
+            "fitness_efficiency_weight": 0.3,  # w2
             "search_space": {
-                "learning_rate": {"type": "log_uniform", "range": [1e-5, 1e-3]},
-                "gaussian_sigma": {"type": "uniform", "range": [0.5, 2.0]},
+                "layer_filters": {"type": "choice", "choices": [8, 12, 16, 20, 24, 32]},
+                "learning_rate": {"type": "log_uniform", "range": [1e-5, 1e-1]},
+                "gaussian_sigma": {"type": "uniform", "choices": [1.0, 1.5, 2.0, 2.5, 3.0]},
             }
         }
     }
@@ -110,16 +115,143 @@ class SalienceCNN(nn.Module):
     def forward(self, x): return self.network(x)
 
 def bkld_loss(y_pred, y_true, eps=1e-7):
-    y_pred = torch.clamp(y_pred, eps, 1 - eps)
-    return -torch.sum(y_true * torch.log(y_pred), dim=(1, 2, 3)).mean()
+    y_pred = torch.clamp(y_pred, eps, 1-eps)
+    y_true = torch.clamp(y_true, eps, 1-eps)
+    bce = - y_true * torch.log(y_pred) - (1 - y_true) * torch.log(1 - y_pred)
+    return bce.mean(dim=(1,2)).mean()
+
+class Block(nn.Module):
+    """ ConvNeXt Block adapted for 2D audio spectrograms. """
+    def __init__(self, dim, layer_scale_init_value=1e-6):
+        super().__init__()
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)  # depthwise conv
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.pwconv1 = nn.Linear(dim, 4 * dim)  # pointwise/1x1 convs implemented as linear layers
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Linear(4 * dim, dim)
+        self.gamma = nn.Parameter(layer_scale_init_value * torch.ones((dim)), 
+                                    requires_grad=True) if layer_scale_init_value > 0 else None
+
+    def forward(self, x):
+        input = x
+        x = self.dwconv(x)
+        x = x.permute(0, 2, 3, 1)  # (N, C, H, W) -> (N, H, W, C)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        if self.gamma is not None:
+            x = self.gamma * x
+        x = x.permute(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)
+
+        x = input + x
+        return x
+
+class ConvNeXt_Tiny(nn.Module):
+    """A tiny ConvNeXt-style model for salience prediction."""
+    def __init__(self, config):
+        super().__init__()
+        # Get hyperparameters from config
+        model_cfg = config['model_params']
+        input_channels = model_cfg.get('input_channels', 5)
+        initial_dim = model_cfg.get('initial_dim', 40)
+        depths = model_cfg.get('depths', [1, 1, 1])    # Number of blocks at each stage
+
+        self.downsample_layers = nn.ModuleList()
+        # Initial stem layer to project input channels to initial_dim
+        stem = nn.Sequential(
+            nn.Conv2d(input_channels, initial_dim, kernel_size=1),
+            nn.GroupNorm(1, initial_dim) # Equivalent to LayerNorm for this shape
+        )
+        self.downsample_layers.append(stem)
+
+        # Main stages
+        stages = []
+        dims = [initial_dim] * len(depths) # For this tiny version, we won't increase dim
+        for i in range(len(depths)):
+            # No downsampling between stages for this task to preserve frequency resolution
+            stage = nn.Sequential(
+                *[Block(dim=dims[i]) for j in range(depths[i])]
+            )
+            stages.append(stage)
+        self.stages = nn.ModuleList(stages)
+
+        # Final output layer
+        self.output_layer = nn.Sequential(
+            nn.Conv2d(dims[-1], 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        x = self.downsample_layers[0](x)
+        x = self.stages[0](x)
+        x = self.stages[1](x)
+        x = self.stages[2](x)
+        x = self.output_layer(x)
+        return x
+
+# --- MODEL REGISTRY ---
+# Place this dictionary right after your model class definitions
+MODEL_REGISTRY = {
+    "SalienceNetV1": SalienceCNN,
+    "ConvNeXt_Tiny": ConvNeXt_Tiny
+}
+
+
+def _to_mir_eval_sequence(times, freqs, atol=1e-6):
+    """
+    Convert event lists into the format expected by mir_eval.multipitch:
+    a sorted array of unique times and a list of 1-D arrays of frequencies.
+    """
+    times, freqs = np.asarray(times, dtype=float), np.asarray(freqs, dtype=float)
+    if times.size == 0:
+        return np.asarray([]), []
+
+    # Data is already sorted by time, so we just need to group
+    out_times = []
+    out_freqs = []
+    
+    # Start with the first event
+    cur_t = times[0]
+    cur_freqs = [freqs[0]]
+
+    for t, f in zip(times[1:], freqs[1:]):
+        if abs(t - cur_t) <= atol: # If it's the same time frame, append frequency
+            cur_freqs.append(f)
+        else: # If it's a new time frame, save the old one and start a new one
+            out_times.append(cur_t)
+            out_freqs.append(np.asarray(cur_freqs, dtype=float))
+            cur_t = t
+            cur_freqs = [f]
+
+    # Append the final group
+    out_times.append(cur_t)
+    out_freqs.append(np.asarray(cur_freqs, dtype=float))
+
+    return np.asarray(out_times, dtype=float), out_freqs
 
 def calculate_f1_score(ref_times, ref_freqs, est_times, est_freqs):
     ref_times, ref_freqs = np.atleast_1d(ref_times), np.atleast_1d(ref_freqs)
     est_times, est_freqs = np.atleast_1d(est_times), np.atleast_1d(est_freqs)
-    if est_times.size == 0 or ref_times.size == 0: p, r, a = (0.0, 0.0, 0.0)
-    else: scores = mir_eval.multipitch.evaluate(ref_times, ref_freqs, est_times, est_freqs); p, r, a = scores['Precision'], scores['Recall'], scores['Accuracy']
-    f1 = 2 * p * r / (p + r) if p + r > 0 else 0.0
-    return {'Precision': p, 'Recall': r, 'Accuracy': a, 'F1-score': f1}
+
+    # Convert to mir_eval's required format
+    ref_time_seq, ref_freqs_seq = _to_mir_eval_sequence(ref_times, ref_freqs)
+    est_time_seq, est_freqs_seq = _to_mir_eval_sequence(est_times, est_freqs)
+
+    if est_time_seq.size == 0 or ref_time_seq.size == 0:
+        scores = {'Precision': 0.0, 'Recall': 0.0, 'Accuracy': 0.0}
+    else:
+        scores = mir_eval.multipitch.evaluate(ref_time_seq, ref_freqs_seq, est_time_seq, est_freqs_seq)
+
+    # Manually calculate F1-score for consistency
+    p, r = scores['Precision'], scores['Recall']
+    if p + r == 0:
+        f1 = 0.0
+    else:
+        f1 = 2 * p * r / (p + r)
+    
+    scores['F1-score'] = f1
+    return scores
 
 # -----------------------------------------------------------------------------
 # SECTION 3: DATA HANDLING AND PROCESSING
@@ -135,8 +267,13 @@ class DataProcessor:
         self.n_bins = self.dp['n_octaves'] * self.dp['bins_per_octave']
         self.log = log_callback
 
+    
     def get_dataset_folder(self, stem_name):
-        """Finds the correct dataset subfolder (e.g., 'Cantoria', 'DCS') for a given stem."""
+        """Finds the correct dataset subfolder for a given stem."""
+        if "choralsynth" in stem_name.lower():
+            return "ChoralSynth" # Or whatever the folder is named
+
+        # Keep existing logic for Cantoria/DCS
         is_cantoria = stem_name.lower().startswith("cantoria")
         is_dcs = stem_name.lower().startswith("dcs")
         try:
@@ -149,25 +286,61 @@ class DataProcessor:
         self.log(f"Warning: Could not determine dataset folder for stem '{stem_name}'.")
         return ""
 
+    # In the DataProcessor class
+
     def process_and_cache_group(self, track_stems):
-        """Processes and caches an entire group of stems as a single mix."""
-        # The cache filename is based on the sorted list of stems in the group
-        cache_fname = "_".join(sorted(track_stems)) + ".npz"
+        """
+        Processes and caches an entire group of stems as a single mix. This function
+        handles different path structures for different datasets.
+        """
+        # Create a single, stable, unique string for the group by sorting and joining.
+        canonical_name = "_".join(sorted(track_stems))
+        # Create a SHA-1 hash of this string to get a safe, fixed-length filename.
+        group_hash = hashlib.sha1(canonical_name.encode('utf-8')).hexdigest()
+        
+        cache_fname = f"{group_hash}.npz"
         cache_path = os.path.join(self.cache_dir, cache_fname)
+
         if os.path.exists(cache_path):
             return cache_path
 
         self.log(f"Processing & Caching Group: {', '.join(track_stems)}")
+        self.log(f"  > Cache file: {cache_path}") # Log the hash for debugging
+
 
         # --- AUDIO MIXING ---
         max_len, all_y = 0, []
+        valid_stems_for_f0 = [] # Keep track of stems that were successfully loaded
+
         for stem in track_stems:
-            dataset_folder = self.get_dataset_folder(stem)
-            audio_path = os.path.join(self.root_dir, dataset_folder, "Audio", f"{stem}.wav")
+            # Heuristic: ChoralSynth stems contain path separators. Cantoria/DCS stems do not.
+            is_choralsynth_style = os.sep in stem
+
+            if is_choralsynth_style:
+                # Path for ChoralSynth: ./datasets/ChoralSynth/<stem>.wav
+                # The `stem` already contains '<trackname>/voices/<stem_base_name>'
+                audio_path = os.path.join(self.root_dir, "ChoralSynth", f"{stem}.wav")
+            else:
+                # Path for Cantoria/DCS: ./datasets/<DatasetName>/Audio/<stem>.wav
+                dataset_folder = self.get_dataset_folder(stem)
+                if not dataset_folder:
+                    self.log(f"ERROR: Could not find dataset folder for stem {stem}")
+                    continue
+                audio_path = os.path.join(self.root_dir, dataset_folder, "Audio", f"{stem}.wav")
+
+            if not os.path.exists(audio_path):
+                self.log(f"ERROR: File not found at resolved path: {audio_path}")
+                continue
+                
             y, _ = librosa.load(audio_path, sr=self.dp['sr'])
             all_y.append(y)
+            valid_stems_for_f0.append(stem) # Add to list for F0 processing
             if len(y) > max_len: max_len = len(y)
         
+        if not all_y:
+            self.log(f"Warning: No valid audio files found for group. Skipping cache generation.")
+            return None
+
         y_mix = np.sum([np.pad(y, (0, max_len - len(y))) for y in all_y], axis=0)
         if np.max(np.abs(y_mix)) > 0:
             y_mix /= np.max(np.abs(y_mix))
@@ -185,31 +358,43 @@ class DataProcessor:
         f0_map = np.zeros((self.n_bins, n_frames), dtype=np.float32)
         total_active_frames = 0
 
-        for stem in track_stems:
-            dataset_folder = self.get_dataset_folder(stem)
-            if not dataset_folder: continue
+        for stem in valid_stems_for_f0:
+            is_choralsynth_style = os.sep in stem
+            interp_freqs = None # Initialize to avoid reference before assignment
+            active_mask = None
 
-            base_path = os.path.join(self.root_dir, dataset_folder)
-            crepe_path = os.path.join(base_path, "F0_crepe", f"{stem}.csv")
-            pyin_path = os.path.join(base_path, "F0_pyin", f"{stem}.csv")
-            if not os.path.exists(crepe_path) or not os.path.exists(pyin_path): continue
+            if is_choralsynth_style:
+                crepe_path = os.path.join(self.root_dir, "ChoralSynth", f"{stem}.f0.csv")
+                if not os.path.exists(crepe_path): continue
+                
+                crepe_df = pd.read_csv(crepe_path)
+                crepe_df.columns = [c.strip() for c in crepe_df.columns]
+                
+                interp_freqs = np.interp(frame_times, crepe_df['time'], crepe_df['frequency'], left=0, right=0)
+                interp_confidence = np.interp(frame_times, crepe_df['time'], crepe_df['confidence'], left=0, right=0)
+                active_mask = (interp_freqs >= self.dp['fmin']) & (interp_confidence > 0.5)
+            else:
+                dataset_folder = self.get_dataset_folder(stem)
+                if not dataset_folder: continue
+                base_path = os.path.join(self.root_dir, dataset_folder)
+                crepe_path = os.path.join(base_path, "F0_crepe", f"{stem}.csv")
+                pyin_path = os.path.join(base_path, "F0_pyin", f"{stem}.csv")
+                if not os.path.exists(crepe_path) or not os.path.exists(pyin_path): continue
+                
+                crepe_df = pd.read_csv(crepe_path)
+                crepe_df.columns = [c.strip() for c in crepe_df.columns]
+                pyin_df = pd.read_csv(pyin_path, header=None, names=['time', 'frequency', 'confidence'])
+                
+                interp_freqs = np.interp(frame_times, crepe_df['time'], crepe_df['frequency'], left=0, right=0)
+                pyin_voiced_mask = (pyin_df['frequency'] > 0).astype(float)
+                interp_voiced = np.interp(frame_times, pyin_df['time'], pyin_voiced_mask, left=0, right=0)
+                active_mask = (interp_freqs >= self.dp['fmin']) & (interp_voiced > 0.5)
 
-            crepe_df = pd.read_csv(crepe_path)
-            crepe_df.columns = [c.strip() for c in crepe_df.columns]
-            pyin_df = pd.read_csv(pyin_path, header=None, names=['time', 'frequency', 'confidence'])
-            
-            interp_freqs = np.interp(frame_times, crepe_df['time'], crepe_df['frequency'], left=0, right=0)
-            pyin_voiced_mask = (pyin_df['frequency'] > 0).astype(float)
-            interp_voiced = np.interp(frame_times, pyin_df['time'], pyin_voiced_mask, left=0, right=0)
-            
-            active_mask = (interp_freqs >= self.dp['fmin']) & (interp_voiced > 0.5)
-            
-            num_active_for_stem = np.sum(active_mask)
-            if num_active_for_stem > 0:
-                total_active_frames += num_active_for_stem
+            if active_mask is not None and np.any(active_mask):
                 frame_idxs = np.where(active_mask)[0]
                 bin_idxs = np.argmin(np.abs(interp_freqs[active_mask, None] - cq_freqs[None, :]), axis=1)
                 f0_map[bin_idxs, frame_idxs] = 1.0
+                total_active_frames += len(frame_idxs)
         
         if total_active_frames == 0:
             self.log(f"  - WARNING: No active frames found for this group. Ground truth will be all zeros.")
@@ -231,21 +416,32 @@ class PatchDataset(Dataset):
     def __init__(self, track_groups, root_dir, cache_dir, config, is_train, log_callback):
         self.config, self.is_train = config, is_train
         self.log = log_callback
+        self.root_dir = root_dir # Add this line
+        self.cache_dir = cache_dir # Add this line
 
         self.tp, self.dp = self.config['training_params'], self.config['data_params']
         self.patch_width_frames = self.tp['patch_width']
-        self.step_size = int(self.patch_width_frames * (1 - self.tp['patch_overlap']))
+        self.step_size = int(self.patch_width_frames * (1 - self.tp.get('patch_overlap', 0.5))) # Use .get for safety
 
         processor = DataProcessor(config, root_dir, cache_dir, log_callback)
         
         self.index = []
         self.cache_data = []
 
-        for group in tqdm(track_groups, desc="Checking and loading cache", leave=False):
-            # The processor now takes the whole group
-            cache_path = processor.process_and_cache_group(group)
-            if cache_path:
-                # Load the data into memory once
+        for group in tqdm(track_groups, desc="Checking and loading cache", leave=False):           
+            # Use the exact same hashing logic as the DataProcessor to find the file.
+            canonical_name = "_".join(sorted(group))
+            group_hash = hashlib.sha1(canonical_name.encode('utf-8')).hexdigest()
+            cache_fname = f"{group_hash}.npz"
+            cache_path = os.path.join(self.cache_dir, cache_fname)
+
+            # Now, ensure the file exists by processing if needed
+            # The `process_and_cache_group` function will use the same hash logic internally.
+            if not os.path.exists(cache_path):
+                processor.process_and_cache_group(group)
+            
+            # Load the data into memory once
+            try:
                 data = np.load(cache_path)
                 self.cache_data.append({
                     'log_hcqt': data['log_hcqt'],
@@ -256,6 +452,8 @@ class PatchDataset(Dataset):
                 current_data_idx = len(self.cache_data) - 1
                 for start in range(0, n_frames - self.patch_width_frames + 1, self.step_size):
                     self.index.append((current_data_idx, start))
+            except Exception as e:
+                self.log(f"ERROR: Could not load or process cache file {cache_path}. Error: {e}")
 
     def __len__(self):
         return len(self.index)
@@ -355,54 +553,125 @@ class DatasetManager:
                     if is_valid:
                         all_groups["DCS"][group_id] = stems
 
+            # --- Strategy 3: For ChoralSynth ---
+            # This assumes ChoralSynth dataset is in a folder like "ChoralSynth"
+            elif "choralsynth" in dataset_folder.lower():
+                self.log(f"-> Applying ChoralSynth discovery logic to: '{dataset_folder}'")
+                base_path = os.path.join(self.root_dir, dataset_folder)
+                
+                # ChoralSynth has subfolders for each track
+                track_folders = [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
+
+                for track_folder in track_folders:
+                    voices_dir = os.path.join(base_path, track_folder, "voices")
+                    if not os.path.exists(voices_dir):
+                        continue
+                    
+                    # The track_folder name (e.g., "08_Anima_nostra") is the group_id
+                    group_id = track_folder
+                    stems_in_group = []
+                    
+                    # Find all .wav files and check for corresponding .f0.csv
+                    for filename in os.listdir(voices_dir):
+                        if filename.endswith('.wav'):
+                            stem_name = filename[:-4] # e.g., "ALTUS"
+                            # The "stem" now needs to include the full path context to be unique
+                            full_stem_path_prefix = os.path.join(track_folder, "voices", stem_name)
+                            
+                            f0_path = os.path.join(base_path, f"{full_stem_path_prefix}.f0.csv")
+                            audio_path = os.path.join(base_path, f"{full_stem_path_prefix}.wav")
+
+                            if os.path.exists(f0_path) and os.path.exists(audio_path):
+                                stems_in_group.append(full_stem_path_prefix)
+                    
+                    if stems_in_group:
+                        # We need a way to distinguish this dataset's groups
+                        dataset_name = "ChoralSynth"
+                        if dataset_name not in all_groups:
+                            all_groups[dataset_name] = {}
+                        all_groups[dataset_name][group_id] = stems_in_group
         return all_groups
 
-    def get_dataloaders(self, config, use_all=False):
-        train_dataset_name = config['data_params']['train_dataset']
+    def get_dataloaders(self, config):
+        """
+        Creates and returns training and validation DataLoaders.
         
-        # --- ROBUST ERROR HANDLING ---
+        This function performs three main tasks:
+        1. Gathers all track groups from the multiple training datasets selected in the config.
+        2. Splits this combined pool of track groups into a training set and a validation set
+        based on the validation split ratio.
+        3. Creates PyTorch PatchDataset and DataLoader objects for both sets.
+        """
+        # Define an empty dataset class for robust error handling
         class EmptyDataset(Dataset):
             def __len__(self): return 0
             def __getitem__(self, idx): raise IndexError
 
-        if not self.track_groups.get(train_dataset_name):
-            self.log(f"ERROR: No valid track groups found for dataset '{train_dataset_name}'. Please check dataset path and structure.")
-            return DataLoader(EmptyDataset()), DataLoader(EmptyDataset())
+        # Check if a train/validation split is already defined in the config
+        if 'train_groups' in config['data_params'] and 'val_groups' in config['data_params']:
+            self.log("Loading persistent train/validation split from config.")
+            train_groups = config['data_params']['train_groups']
+            val_groups = config['data_params']['val_groups']
+            new_config = None # No changes to config, so nothing to return
 
-        # ... (the rest of the method remains the same as the previous fix)
-        train_val_groups = list(self.track_groups[train_dataset_name].values())
-        random.shuffle(train_val_groups)
-
-        if use_all:
-            train_groups = train_val_groups
-            val_groups = train_val_groups[-max(1, int(len(train_val_groups)*0.1)):]
         else:
-            num_total = len(train_val_groups)
-            num_val = int(num_total * config['training_params']['val_split_ratio'])
-            if num_total > 1: num_val = max(1, num_val)
-            else: num_val = 1
-            if num_total - num_val < 1 and num_total > 1: num_val = num_total - 1
-            val_groups = train_val_groups[:num_val]
-            train_groups = train_val_groups[num_val:]
+            # --- NO SPLIT FOUND, GENERATE A NEW ONE ---
+            self.log("No split found in config. Generating a new random train/validation split.")
+
+            # 1. GATHER AND COMBINE TRACK GROUPS
+            train_dataset_names = config['data_params'].get('train_datasets', [])
+            # ... (rest of the gathering logic is the same as before) ...
+            all_track_groups = []
+            for name in train_dataset_names:
+                if name in self.track_groups:
+                    all_track_groups.extend(list(self.track_groups[name].values()))
+                else:
+                    self.log(f"Warning: Selected training dataset '{name}' not found in manager.")
+            
+            if not all_track_groups:
+                self.log("ERROR: No valid track groups found for the selected training datasets.")
+                return DataLoader(EmptyDataset()), DataLoader(EmptyDataset()), None
+
+            random.shuffle(all_track_groups)
+
+            # 2. PERFORM THE SPLIT
+            num_total = len(all_track_groups)
+            val_split_ratio = config['training_params'].get('val_split_ratio', 0.1)
+            num_val = int(num_total * val_split_ratio)
+            # ... (rest of the splitting logic is the same) ...
+            if num_total > 1 and num_val == 0: num_val = 1
+            if num_total > 1 and num_val == num_total: num_val = num_total - 1
+
+            val_groups = all_track_groups[:num_val]
+            train_groups = all_track_groups[num_val:]
             if not train_groups and val_groups: train_groups = val_groups
 
-        self.log(f"Training on {len(train_groups)} groups, validating on {len(val_groups)} groups from {train_dataset_name}.")
+            # --- IMPORTANT NEW STEP: UPDATE THE CONFIG OBJECT ---
+            # We add the generated split to the config dictionary so it can be saved.
+            config['data_params']['train_groups'] = train_groups
+            config['data_params']['val_groups'] = val_groups
+            new_config = config # This updated config will be returned to be saved.
+
+        # --- 3. CREATE DATASET AND DATALOADER OBJECTS (this part is mostly the same) ---
+        train_dataset_names_str = ', '.join(config['data_params'].get('train_datasets', []))
+        self.log(f"Using datasets: {train_dataset_names_str}")
+        self.log(f"Preparing {len(train_groups)} training groups and {len(val_groups)} validation groups.")
 
         if not train_groups:
-            self.log("ERROR: Training group is empty after split. Cannot create DataLoader.")
-            return DataLoader(EmptyDataset()), DataLoader(EmptyDataset())
+            self.log("ERROR: Training group is empty. Cannot create DataLoader.")
+            return DataLoader(EmptyDataset()), DataLoader(EmptyDataset()), new_config
 
         train_dataset = PatchDataset(train_groups, self.root_dir, self.cache_dir, config, is_train=True, log_callback=self.log)
         val_dataset = PatchDataset(val_groups, self.root_dir, self.cache_dir, config, is_train=False, log_callback=self.log)
 
         if len(train_dataset) == 0:
-            self.log(f"ERROR: Train dataset for '{train_dataset_name}' is empty after processing patches. There might be no audio long enough to create patches.")
-            return DataLoader(EmptyDataset()), DataLoader(EmptyDataset())
+            self.log(f"ERROR: Training dataset is empty after processing patches. Audio files might be too short.")
+            return DataLoader(EmptyDataset()), DataLoader(EmptyDataset()), new_config
 
         train_loader = DataLoader(train_dataset, batch_size=config['training_params']['batch_size'], shuffle=True, num_workers=0, pin_memory=True)
         val_loader = DataLoader(val_dataset, batch_size=config['evaluation_params']['eval_batch_size'], shuffle=False, num_workers=0, pin_memory=True)
         
-        return train_loader, val_loader
+        return train_loader, val_loader, new_config
 
 # -----------------------------------------------------------------------------
 # SECTION 4: TRAINING & EVALUATION ENGINE
@@ -417,114 +686,192 @@ class Trainer:
         # The checkpoint directory is based on the hash (run_id)
         self.checkpoint_dir = os.path.join("checkpoints", config['run_id'])
         os.makedirs(self.checkpoint_dir, exist_ok=True)
-        
-        # Save the config file regardless
-        with open(os.path.join(self.checkpoint_dir, 'config.json'), 'w') as f:
-            json.dump(config, f, indent=4)
 
     def train(self):
         self.log(f"Starting training for run: {self.config['run_id']}")
-        model = SalienceCNN(self.config).to(self.device)
+        
+        # --- DYNAMIC MODEL INSTANTIATION ---
+        model_name = self.config['model_params']['architecture_name']
+        if model_name not in MODEL_REGISTRY:
+            self.log(f"ERROR: Model '{model_name}' not found in registry. Aborting.")
+            return None, None
+        
+        model_class = MODEL_REGISTRY[model_name]
+        model = model_class(self.config).to(self.device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=self.config['training_params']['learning_rate'])
         criterion = bkld_loss
 
-        # --- CHECKPOINT LOADING LOGIC ---
-        start_epoch = 0
+        self.log(f"Model: '{model_name}' created with {sum(p.numel() for p in model.parameters()):,} parameters.")
+
+        # --- PERSISTENT DATA SPLIT LOGIC ---
+        config_path = os.path.join(self.checkpoint_dir, 'config.json')
+        if os.path.exists(config_path):
+            self.log("Found existing config.json, loading for persistent data split.")
+            with open(config_path, 'r') as f:
+                self.config = json.load(f)
+
+        train_loader, val_loader, updated_config = self.data_manager.get_dataloaders(self.config)
+
+        if updated_config is not None:
+            self.log("A new train/validation split was generated. Saving to config.json.")
+            self.config = updated_config
+            with open(config_path, 'w') as f:
+                json.dump(self.config, f, indent=4)
+        
+        # --- DYNAMIC STEP CALCULATION ---
+        tp = self.config['training_params']
+        num_epochs = tp.get('num_epochs', 30)
+        batch_size = tp.get('batch_size', 16)
+        
+        if train_loader is None or len(train_loader.dataset) == 0:
+            self.log("ERROR: Cannot calculate training steps, training dataset is empty.")
+            return None, None
+            
+        num_patches = len(train_loader.dataset)
+        steps_per_epoch = (num_patches + batch_size - 1) // batch_size
+        total_train_steps = steps_per_epoch * num_epochs
+        steps_per_checkpoint = tp.get("steps_per_checkpoint", max(1, steps_per_epoch // 2))
+        
+        self.log(f"Training configured for {num_epochs} epochs.")
+        self.log(f"Dataset has {num_patches} patches, with batch size {batch_size}.")
+        self.log(f"This translates to {steps_per_epoch} steps/epoch, for a total of {total_train_steps} training steps.")
+        self.log(f"Checkpoints and validation will occur every {steps_per_checkpoint} steps.")
+        
+        # --- SINGLE, UNIFIED CHECKPOINT AND METRICS LOADING ---
+        global_step = 0
         best_val_loss = float('inf')
+        metrics = {'train_loss': [], 'val_loss': [], 'steps': []}
+        
         metrics_path = os.path.join(self.checkpoint_dir, 'metrics.json')
         latest_model_path = os.path.join(self.checkpoint_dir, "latest_model.pth")
-        
+
         if os.path.exists(latest_model_path):
-            self.log("Found existing checkpoint. Resuming training.")
+            self.log("Found existing model checkpoint. Resuming training.")
             try:
                 checkpoint = torch.load(latest_model_path, map_location=self.device)
                 model.load_state_dict(checkpoint['model_state_dict'])
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                start_epoch = checkpoint['epoch']
-                best_val_loss = checkpoint['best_val_loss']
+                global_step = checkpoint.get('global_step', 0)
+                best_val_loss = checkpoint.get('best_val_loss', float('inf'))
                 
-                with open(metrics_path, 'r') as f:
-                    metrics = json.load(f)
+                if os.path.exists(metrics_path):
+                    with open(metrics_path, 'r') as f:
+                        metrics = json.load(f)
                 
-                self.log(f"Resuming from end of epoch {start_epoch}. Best validation loss so far: {best_val_loss:.4f}")
-                # Immediately send the loaded history to the UI so the plot appears
+                self.log(f"Resuming from step {global_step}. Best validation loss so far: {best_val_loss:.4f}")
                 self.epoch_end_callback(metrics.copy())
             except Exception as e:
                 self.log(f"Error loading checkpoint, starting fresh. Error: {e}")
-                start_epoch = 0
-                metrics = {'train_loss': [], 'val_loss': []}
+                global_step = 0
+                best_val_loss = float('inf')
+                metrics = {'train_loss': [], 'val_loss': [], 'steps': []}
         else:
             self.log("No checkpoint found. Starting fresh training.")
-            metrics = {'train_loss': [], 'val_loss': []}
-        
-        train_loader, val_loader = self.data_manager.get_dataloaders(self.config)
-        num_epochs = self.config['training_params']['num_epochs']
-        
-        if start_epoch >= num_epochs:
-            self.log("Model has already been trained for the specified number of epochs or more.")
-            self.epoch_end_callback(metrics) # Show final plot
+
+        # --- MAIN STEP-BASED TRAINING LOOP ---
+        if global_step >= total_train_steps:
+            self.log("Model has already been trained for the specified number of steps or more.")
+            self.epoch_end_callback(metrics)
             return self.checkpoint_dir, metrics
 
-        for epoch in range(start_epoch, num_epochs):
-            # --- Training Phase ---
-            model.train()
-            total_train_loss = 0
-            train_iterator = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [T]", leave=False)
-            for cqt_batch, f0_batch in train_iterator:
-                cqt_batch, f0_batch = cqt_batch.to(self.device), f0_batch.to(self.device)
-                optimizer.zero_grad()
-                outputs = model(cqt_batch)
-                loss = criterion(outputs, f0_batch)
-                loss.backward()
-                optimizer.step()
-                total_train_loss += loss.item()
-            metrics['train_loss'].append(total_train_loss / len(train_loader))
-
-            # --- Validation Phase ---
-            model.eval()
-            total_val_loss = 0
-            val_iterator = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [V]", leave=False)
-            with torch.no_grad():
-                for cqt_batch, f0_batch in val_iterator:
-                    cqt_batch, f0_batch = cqt_batch.to(self.device), f0_batch.to(self.device)
-                    outputs = model(cqt_batch)
-                    loss = criterion(outputs, f0_batch)
-                    total_val_loss += loss.item()
-            avg_val_loss = total_val_loss / len(val_loader)
-            metrics['val_loss'].append(avg_val_loss)
-
-            self.log(f"E {epoch+1}/{num_epochs} | Train Loss: {metrics['train_loss'][-1]:.4f} | Val Loss: {avg_val_loss:.4f}")
-
-            # --- CHECKPOINT SAVING LOGIC ---
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                torch.save(model.state_dict(), os.path.join(self.checkpoint_dir, "best_model.pth"))
-                self.log(f"  > New best val_loss. Best model saved.")
-
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'best_val_loss': best_val_loss,
-            }, latest_model_path)
+        model.train()
+        train_iterator = iter(train_loader)
+        pbar = tqdm(initial=global_step, total=total_train_steps, desc="Training Steps")
+        
+        while global_step < total_train_steps:
+            try:
+                cqt_batch, f0_batch = next(train_iterator)
+            except StopIteration:
+                self.log(f"--- Epoch finished at step {global_step}. Shuffling data for next epoch. ---")
+                train_iterator = iter(train_loader)
+                cqt_batch, f0_batch = next(train_iterator)
+                
+            cqt_batch, f0_batch = cqt_batch.to(self.device), f0_batch.to(self.device)
             
-            with open(metrics_path, 'w') as f:
-                json.dump(metrics, f, indent=4)
+            optimizer.zero_grad()
+            outputs = model(cqt_batch)
+            loss = criterion(outputs, f0_batch)
+            loss.backward()
+            optimizer.step()
 
-            self.progress(epoch + 1, num_epochs)
-            self.epoch_end_callback(metrics.copy())
+            if (global_step + 1) % steps_per_checkpoint == 0 or (global_step + 1) == total_train_steps:
+                avg_val_loss = self._run_validation(model, val_loader, criterion)
+                
+                metrics['val_loss'].append(avg_val_loss)
+                metrics['steps'].append(global_step + 1)
+                
+                self.log(f"Step {global_step+1}/{total_train_steps} | Val Loss: {avg_val_loss:.4f}")
+                
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    torch.save(model.state_dict(), os.path.join(self.checkpoint_dir, "best_model.pth"))
+                    self.log(f"  > New best val_loss. Best model saved.")
 
+                torch.save({
+                    'global_step': global_step + 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_val_loss': best_val_loss,
+                }, latest_model_path)
+
+                with open(metrics_path, 'w') as f:
+                    json.dump(metrics, f, indent=4)
+                
+                self.epoch_end_callback(metrics.copy())
+                model.train()
+
+            global_step += 1
+            pbar.update(1)
+            self.progress(global_step, total_train_steps)
+
+        pbar.close()
         self.log("Training finished.")
         return self.checkpoint_dir, metrics
+    
+    def _run_validation(self, model, val_loader, criterion):
+        """Helper to run the validation loop and return the average loss."""
+        model.eval()
+        total_val_loss = 0
+        if val_loader is None or len(val_loader) == 0:
+            return float('inf')
+
+        with torch.no_grad():
+            for cqt_batch, f0_batch in val_loader:
+                cqt_batch, f0_batch = cqt_batch.to(self.device), f0_batch.to(self.device)
+                outputs = model(cqt_batch)
+                loss = criterion(outputs, f0_batch)
+                total_val_loss += loss.item()
+        return total_val_loss / len(val_loader)
 
 class Evaluator:
     """Same as the provided complete version."""
     def __init__(self, checkpoint_path, device, log_callback, progress_callback):
-        self.device, self.log, self.progress = device, log_callback, progress_callback
-        with open(os.path.join(checkpoint_path, "config.json"), 'r') as f: self.config = json.load(f)
-        self.model = SalienceCNN(self.config).to(self.device)
-        self.model.load_state_dict(torch.load(os.path.join(checkpoint_path, "best_model.pth"), map_location=device)); self.model.eval()
-        self.log(f"Evaluator ready. Loaded model from {checkpoint_path}")
+        self.device = device
+        self.log = log_callback
+        self.progress = progress_callback
+        
+        config_path = os.path.join(checkpoint_path, "config.json")
+        model_path = os.path.join(checkpoint_path, "best_model.pth")
+        
+        with open(config_path, 'r') as f:
+            self.config = json.load(f)
+            
+        # --- DYNAMIC MODEL INSTANTIATION ---
+        model_name = self.config['model_params']['architecture_name']
+        if model_name not in MODEL_REGISTRY:
+            self.log(f"ERROR: Model '{model_name}' from checkpoint not found in registry. Cannot evaluate.")
+            # Handle this gracefully, maybe by raising an exception or setting a flag
+            self.model = None
+            return
+
+        model_class = MODEL_REGISTRY[model_name]
+        self.model = model_class(self.config).to(self.device)
+        # --- END OF CHANGE ---
+
+        self.model.load_state_dict(torch.load(model_path, map_location=device))
+        self.model.eval()
+        self.log(f"Evaluator ready. Loaded model '{model_name}' from {checkpoint_path}")
+
     def _run_inference(self, audio_mix):
         dp, tp, n_bins = self.config['data_params'], self.config['training_params'], self.config['data_params']['n_octaves'] * self.config['data_params']['bins_per_octave']
         cqt_list = [librosa.cqt(audio_mix, sr=dp['sr'], hop_length=dp['hop_length'], fmin=dp['fmin'] * h, n_bins=n_bins, bins_per_octave=dp['bins_per_octave']) for h in dp['harmonics']]
@@ -542,20 +889,71 @@ class Evaluator:
         ov_count[ov_count == 0] = 1e-6; salience_map = out_map / ov_count
         if salience_map.max() > 0: salience_map /= salience_map.max()
         return salience_map
+    
     def _get_ground_truth(self, track_stems, root_dir, n_frames):
-        dp, ref_times, ref_freqs = self.config['data_params'], [], []
+        """Reuses DataProcessor logic to get ground truth F0 map."""
+        dp = self.config['data_params']
         frame_times = librosa.frames_to_time(np.arange(n_frames), sr=dp['sr'], hop_length=dp['hop_length'])
-        processor = DataProcessor(self.config, root_dir, "./cache", self.log)
+        
+        ref_times_list, ref_freqs_list = [], []
+
         for stem in track_stems:
-            dataset_folder = processor.get_dataset_folder(stem); base_path = os.path.join(root_dir, dataset_folder)
-            crepe_path, pyin_path = os.path.join(base_path, "F0_crepe", f"{stem}.csv"), os.path.join(base_path, "F0_pyin", f"{stem}.csv")
-            if not os.path.exists(crepe_path) or not os.path.exists(pyin_path): continue
-            crepe_df, pyin_df = pd.read_csv(crepe_path), pd.read_csv(pyin_path, header=None, names=['time', 'f0', 'confidence'])
-            interp_freqs = np.interp(frame_times, crepe_df['time'], crepe_df['frequency'], left=0, right=0)
-            interp_voiced = np.interp(frame_times, pyin_df['time'], (pyin_df['f0'] > 0).astype(float), left=0, right=0)
-            active = (interp_freqs >= dp['fmin']) & (interp_voiced > 0.5)
-            if np.any(active): ref_times.extend(frame_times[active]); ref_freqs.extend(interp_freqs[active])
-        return np.array(ref_times), np.array(ref_freqs)
+            is_choralsynth_style = os.sep in stem
+            interp_freqs = None # Initialize to avoid reference before assignment
+            active = None
+
+            if is_choralsynth_style:
+                # ChoralSynth F0 file logic
+                crepe_path = os.path.join(root_dir, "ChoralSynth", f"{stem}.f0.csv")
+                if not os.path.exists(crepe_path): continue
+
+                crepe_df = pd.read_csv(crepe_path)
+                crepe_df.columns = [c.strip() for c in crepe_df.columns]
+                
+                interp_freqs = np.interp(frame_times, crepe_df['time'], crepe_df['frequency'], left=0, right=0)
+                interp_confidence = np.interp(frame_times, crepe_df['time'], crepe_df['confidence'], left=0, right=0)
+                active = (interp_freqs >= dp['fmin']) & (interp_confidence > 0.5)
+
+            else:
+                # Cantoria/DCS F0 file logic
+                processor = DataProcessor(self.config, root_dir, "./cache", self.log)
+                dataset_folder = processor.get_dataset_folder(stem)
+                if not dataset_folder: continue
+
+                base_path = os.path.join(root_dir, dataset_folder)
+                crepe_path = os.path.join(base_path, "F0_crepe", f"{stem}.csv")
+                pyin_path = os.path.join(base_path, "F0_pyin", f"{stem}.csv")
+                if not os.path.exists(crepe_path) or not os.path.exists(pyin_path): continue
+
+                crepe_df = pd.read_csv(crepe_path)
+                crepe_df.columns = [c.strip() for c in crepe_df.columns]
+                pyin_df = pd.read_csv(pyin_path, header=None, names=['time', 'frequency', 'confidence'])
+                
+                interp_freqs = np.interp(frame_times, crepe_df['time'], crepe_df['frequency'], left=0, right=0)
+                pyin_voiced_mask = (pyin_df['frequency'] > 0).astype(float)
+                interp_voiced = np.interp(frame_times, pyin_df['time'], pyin_voiced_mask, left=0, right=0)
+                active = (interp_freqs >= dp['fmin']) & (interp_voiced > 0.5)
+
+            if active is not None and np.any(active):
+                ref_times_list.extend(frame_times[active])
+                ref_freqs_list.extend(interp_freqs[active])
+        
+        # Convert to numpy arrays
+        ref_times = np.array(ref_times_list)
+        ref_freqs = np.array(ref_freqs_list)
+
+        if ref_times.size == 0:
+            return ref_times, ref_freqs # Return empty arrays if no pitches found
+
+        # Get the indices that would sort the time array
+        sort_indices = np.argsort(ref_times)
+        
+        # Apply these indices to both arrays to sort them together
+        sorted_ref_times = ref_times[sort_indices]
+        sorted_ref_freqs = ref_freqs[sort_indices]
+
+        return sorted_ref_times, sorted_ref_freqs
+    
     def _extract_pitches(self, salience_map, threshold):
         dp, n_bins = self.config['data_params'], self.config['data_params']['n_octaves'] * self.config['data_params']['bins_per_octave']
         times = librosa.times_like(salience_map, sr=dp['sr'], hop_length=dp['hop_length'])
@@ -581,24 +979,103 @@ class Evaluator:
         scores = calculate_f1_score(ref_times, ref_freqs, est_times, est_freqs)
         self.log(f"Scores: F1={scores['F1-score']:.3f}, P={scores['Precision']:.3f}, R={scores['Recall']:.3f}")
         return scores, (ref_times, ref_freqs), (est_times, est_freqs)
-    def tune_threshold(self, track_stems, root_dir):
-        self.log(f"Tuning threshold for: {', '.join(track_stems)}")
-        processor = DataProcessor(self.config, root_dir, "./cache", self.log); max_len, all_y = 0, []
-        for stem in track_stems:
-            dataset_folder = processor.get_dataset_folder(stem); audio_path = os.path.join(root_dir, dataset_folder, "Audio", f"{stem}.wav")
-            y, _ = librosa.load(audio_path, sr=self.config['data_params']['sr']); all_y.append(y)
-            if len(y) > max_len: max_len = len(y)
-        audio_mix = np.sum([np.pad(y, (0, max_len - len(y))) for y in all_y], axis=0)
-        salience_map = self._run_inference(audio_mix)
-        ref_times, ref_freqs = self._get_ground_truth(track_stems, root_dir, salience_map.shape[1])
-        best_f1, best_thresh = -1, 0; thresholds = np.arange(0.1, 0.8, 0.05)
-        for i, thresh in enumerate(thresholds):
-            est_times, est_freqs = self._extract_pitches(salience_map, thresh)
-            scores = calculate_f1_score(ref_times, ref_freqs, est_times, est_freqs)
-            if scores['F1-score'] > best_f1: best_f1, best_thresh = scores['F1-score'], thresh
-            self.progress(i + 1, len(thresholds))
-        self.log(f"Optimal threshold: {best_thresh:.2f} (F1: {best_f1:.3f})")
-        return best_thresh, best_f1
+    
+    def tune_threshold(self, all_eval_track_groups, root_dir):
+        """
+        Tunes the peak-picking threshold using an efficient ternary search to find
+        the value that maximizes the AVERAGE F1-score across the evaluation set.
+        """
+        num_tracks = len(all_eval_track_groups)
+        self.log(f"Tuning threshold across {num_tracks} tracks using Ternary Search...")
+        
+        processor = DataProcessor(self.config, root_dir, "./cache", self.log)
+        
+        # --- Step 1: Pre-compute salience maps (this part remains the same) ---
+        salience_maps = {}
+        ground_truths = {}
+        
+        track_values = list(all_eval_track_groups.values())
+        for i, track_stems in enumerate(tqdm(track_values, desc="Pre-computing Salience Maps", leave=False)):
+            group_id = "_".join(sorted(track_stems))
+            
+            max_len, all_y = 0, []
+            for stem in track_stems:
+                dataset_folder = processor.get_dataset_folder(stem)
+                audio_path = os.path.join(root_dir, dataset_folder, "Audio", f"{stem}.wav")
+                y, _ = librosa.load(audio_path, sr=self.config['data_params']['sr'])
+                all_y.append(y)
+                if len(y) > max_len: max_len = len(y)
+            audio_mix = np.sum([np.pad(y, (0, max_len - len(y))) for y in all_y], axis=0)
+
+            salience_map = self._run_inference(audio_mix)
+            salience_maps[group_id] = salience_map
+            
+            ref_times, ref_freqs = self._get_ground_truth(track_stems, root_dir, salience_map.shape[1])
+            ground_truths[group_id] = (ref_times, ref_freqs)
+            
+            self.progress(i + 1, num_tracks)
+
+        self.log("All salience maps pre-computed. Starting efficient search...")
+
+        # --- Step 2: Helper function to evaluate a single threshold ---
+        # This avoids code duplication inside the search loop.
+        memo = {} # Memoization to cache results for thresholds we've already seen
+        def get_avg_f1(thresh):
+            if thresh in memo:
+                return memo[thresh]
+                
+            f1_scores = []
+            for track_stems in all_eval_track_groups.values():
+                lookup_id = "_".join(sorted(track_stems))
+                salience_map = salience_maps[lookup_id]
+                ref_times, ref_freqs = ground_truths[lookup_id]
+                
+                est_times, est_freqs = self._extract_pitches(salience_map, thresh)
+                scores = calculate_f1_score(ref_times, ref_freqs, est_times, est_freqs)
+                f1_scores.append(scores['F1-score'])
+            
+            avg_f1 = np.mean(f1_scores)
+            self.log(f"  - Testing Threshold {thresh:.4f}: Average F1 = {avg_f1:.4f}")
+            memo[thresh] = avg_f1
+            return avg_f1
+
+        # --- Step 3: Ternary Search Implementation ---
+        low = 0.1
+        high = 0.8
+        # We can use a fixed number of iterations for simplicity and guaranteed termination
+        # 10 iterations will narrow the range [0.1, 0.8] down to a width of ~0.01
+        iterations = 10 
+
+        for i in range(iterations):
+            # If the range is already very small, we can stop early
+            if (high - low) < 0.01:
+                break
+                
+            # Update progress bar for search iterations
+            self.progress(i + 1, iterations)
+
+            # Calculate two midpoints
+            m1 = low + (high - low) / 3
+            m2 = high - (high - low) / 3
+            
+            f1_m1 = get_avg_f1(m1)
+            f1_m2 = get_avg_f1(m2)
+
+            if f1_m1 < f1_m2:
+                low = m1  # The peak is in the right two-thirds
+            else:
+                high = m2 # The peak is in the left two-thirds
+                
+        # The optimal threshold is now within the small [low, high] range.
+        # We can take the midpoint as our final answer.
+        best_thresh = (low + high) / 2
+        best_avg_f1 = get_avg_f1(best_thresh) # One final calculation for the report
+
+        self.log(f"--- Optimal threshold found via Ternary Search ---")
+        self.log(f"  > Optimal Threshold: {best_thresh:.4f}")
+        self.log(f"  > Best Average F1-score: {best_avg_f1:.4f}")
+        
+        return best_thresh, best_avg_f1
 
 class HyperparameterTuner:
     def __init__(self, base_config, device, data_manager, log_callback, progress_callback):
@@ -724,7 +1201,7 @@ class SalienceStudioApp(ctk.CTk):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.ui_queue = Queue()
 
-        self.grid_columnconfigure(0, weight=1); self.grid_rowconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=1); self.grid_rowconfigure(0, weight=4); self.grid_rowconfigure(1, weight=1)
         self.console_frame = ctk.CTkFrame(self); self.console_frame.grid(row=1, column=0, padx=10, pady=(0,10), sticky="nsew")
         self.console_frame.grid_rowconfigure(1, weight=1); self.console_frame.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(self.console_frame, text="Log Console").grid(row=0, column=0, sticky="w", padx=5)
@@ -740,7 +1217,7 @@ class SalienceStudioApp(ctk.CTk):
 
     def _create_train_tab(self):
         tab = self.tab_view.tab("Train")
-        tab.grid_columnconfigure(0, weight=2)
+        tab.grid_columnconfigure(0, weight=1)
         tab.grid_columnconfigure(1, weight=1)
         tab.grid_rowconfigure(0, weight=2)
         tab.grid_rowconfigure(1, weight=1)
@@ -750,11 +1227,28 @@ class SalienceStudioApp(ctk.CTk):
 
         self.train_widgets = {}
 
+        # --- Model Parameters ---
+        ctk.CTkLabel(settings_frame, text="Model Architecture", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(10,0))
+
         # --- Data Parameters ---
-        ctk.CTkLabel(settings_frame, text="Train Dataset", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(10,0))
-        self.train_widgets['train_dataset'] = ctk.CTkOptionMenu(settings_frame, values=["Cantoria", "DCS"])
-        self.train_widgets['train_dataset'].set(self.config["data_params"]["train_dataset"])
-        self.train_widgets['train_dataset'].pack(fill="x", padx=10, pady=(0,10))
+        ctk.CTkLabel(settings_frame, text="Training Datasets", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(10,0))
+        self.train_dataset_checkboxes = {}
+        # Get all discovered dataset names from the manager
+        dataset_names = list(self.data_manager.track_groups.keys())
+        for name in dataset_names:
+            var = ctk.StringVar(value="on") # Default to training on this dataset
+            chk = ctk.CTkCheckBox(settings_frame, text=name, variable=var, onvalue="on", offvalue="off")
+            chk.pack(anchor="w", padx=20)
+            self.train_dataset_checkboxes[name] = var
+
+        ctk.CTkLabel(settings_frame, text="Evaluation Dataset", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(10,0))
+        self.train_widgets['eval_dataset'] = ctk.CTkOptionMenu(settings_frame, values=dataset_names)
+        # Automatically select a different dataset for evaluation
+        if len(dataset_names) > 1:
+            self.train_widgets['eval_dataset'].set(dataset_names[1])
+        else:
+            self.train_widgets['eval_dataset'].set(dataset_names[0])
+        self.train_widgets['eval_dataset'].pack(fill="x", padx=10, pady=(0,10))
 
         # --- Training Parameters ---
         ctk.CTkLabel(settings_frame, text="Training Hyperparameters", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(10,0))
@@ -770,6 +1264,13 @@ class SalienceStudioApp(ctk.CTk):
         ctk.CTkLabel(settings_frame, text="Batch Size").pack(anchor="w", padx=10, pady=(10,0))
         self.train_widgets['batch_size'] = ctk.CTkEntry(settings_frame, placeholder_text=str(self.config['training_params']['batch_size']))
         self.train_widgets['batch_size'].pack(fill="x", padx=10)
+
+        
+        # Get model names from the registry
+        model_names = list(MODEL_REGISTRY.keys())
+        self.train_widgets['architecture_name'] = ctk.CTkOptionMenu(settings_frame, values=model_names)
+        self.train_widgets['architecture_name'].set(self.config["model_params"]["architecture_name"])
+        self.train_widgets['architecture_name'].pack(fill="x", padx=10, pady=(0,10))
 
         # --- Control Buttons and Progress Bar ---
         self.train_button = ctk.CTkButton(tab, text="Start Training", command=self.start_training_thread)
@@ -810,6 +1311,9 @@ class SalienceStudioApp(ctk.CTk):
 
         self.eval_button = ctk.CTkButton(settings_frame, text="Evaluate Track", command=self.start_evaluation_thread, state="disabled")
         self.eval_button.pack(fill="x", padx=10, pady=20)
+
+        self.tune_single_track_button = ctk.CTkButton(settings_frame, text="Tune Threshold for This Track", command=self.start_single_track_tuning_thread, state="disabled")
+        self.tune_single_track_button.pack(fill="x", padx=10, pady=10)
 
         self.tune_button = ctk.CTkButton(settings_frame, text="Auto-Tune Threshold", command=self.start_tuning_thread, state="disabled")
         self.tune_button.pack(fill="x", padx=10, pady=(0,20))
@@ -906,13 +1410,55 @@ class SalienceStudioApp(ctk.CTk):
     def start_tuning_thread(self):
         checkpoint_path = os.path.join("checkpoints", self.checkpoint_menu.get())
         evaluator = Evaluator(checkpoint_path, self.device, self.log_threadsafe, self.eval_progress_threadsafe)
+        
+        # Get the config from the loaded checkpoint to know which dataset to use
         eval_dataset_name = evaluator.config['data_params']['eval_dataset']
-        track_stems = self.data_manager.track_groups[eval_dataset_name].get(self.eval_track_menu.get())
-        threading.Thread(target=self.run_tuning, args=(evaluator, track_stems), daemon=True).start()
-        self.eval_button.configure(state="disabled"); self.tune_button.configure(state="disabled")
+        # --- PASS THE ENTIRE DICTIONARY OF TRACKS ---
+        all_tracks_for_eval = self.data_manager.track_groups[eval_dataset_name]
+        print("all tracks", all_tracks_for_eval)
 
-    def run_tuning(self, evaluator, track_stems):
-        self.ui_queue.put(("tuning_complete", evaluator.tune_threshold(track_stems, self.root_dir)))
+        if not all_tracks_for_eval:
+            self.log(f"ERROR: No tracks found in the evaluation dataset '{eval_dataset_name}'. Cannot tune threshold.")
+            return
+
+        threading.Thread(target=self.run_tuning, args=(evaluator, all_tracks_for_eval), daemon=True).start()
+        self.eval_button.configure(state="disabled")
+        self.tune_button.configure(state="disabled")
+
+    def run_tuning(self, evaluator, all_tracks_for_eval):
+        # We need to pass the dictionary values (the lists of stems) to the method
+        best_thresh, best_f1 = evaluator.tune_threshold(all_tracks_for_eval, self.root_dir)
+        self.ui_queue.put(("tuning_complete", (best_thresh, best_f1)))
+
+    def start_single_track_tuning_thread(self):
+        """Starts threshold tuning for only the currently selected track."""
+        checkpoint_path = os.path.join("checkpoints", self.checkpoint_menu.get())
+        evaluator = Evaluator(checkpoint_path, self.device, self.log_threadsafe, self.eval_progress_threadsafe)
+        
+        # Get the config from the loaded checkpoint to know which dataset to use
+        eval_dataset_name = evaluator.config['data_params']['eval_dataset']
+        
+        # --- GET ONLY THE SELECTED TRACK ---
+        selected_track_id = self.eval_track_menu.get()
+        if selected_track_id == "None":
+            self.log("ERROR: No track selected to tune for. Please select a track.")
+            return
+
+        # Create a dictionary containing only the selected track's stems
+        # This format is required by the tune_threshold method
+        track_stems = self.data_manager.track_groups[eval_dataset_name].get(selected_track_id)
+        single_track_dict = {selected_track_id: track_stems}
+        
+        self.log(f"Starting threshold tuning for single track: {selected_track_id}")
+
+        # The run_tuning method is generic enough to work with our single-item dictionary
+        threading.Thread(target=self.run_tuning, args=(evaluator, single_track_dict), daemon=True).start()
+        
+        # Disable all buttons during operation
+        self.eval_button.configure(state="disabled")
+        self.tune_single_track_button.configure(state="disabled")
+        self.tune_button.configure(state="disabled")
+
 
     def start_hp_tuning_thread(self):
         self.update_tuning_config_from_ui()
@@ -956,11 +1502,11 @@ class SalienceStudioApp(ctk.CTk):
 
     def handle_evaluation_completion(self, data):
         scores, ref_data, est_data = data; self.plot_evaluation_result(ref_data, est_data)
-        self.eval_button.configure(state="normal"); self.tune_button.configure(state="normal"); self.eval_progress_bar.set(0)
+        self.eval_button.configure(state="normal"); self.tune_button.configure(state="normal"); self.tune_single_track_button.configure(state="normal"); self.eval_progress_bar.set(0)
 
     def handle_tuning_completion(self, data):
         best_thresh, best_f1 = data; self.threshold_entry.delete(0, 'end'); self.threshold_entry.insert(0, f"{best_thresh:.2f}")
-        self.eval_button.configure(state="normal"); self.tune_button.configure(state="normal"); self.eval_progress_bar.set(0)
+        self.eval_button.configure(state="normal"); self.tune_button.configure(state="normal"); self.tune_single_track_button.configure(state="normal"); self.eval_progress_bar.set(0)
 
     def handle_hp_tuning_completion(self, data):
         history = data; self.plot_tuning_history(history)
@@ -998,8 +1544,9 @@ class SalienceStudioApp(ctk.CTk):
         self.checkpoint_menu.configure(values=checkpoints); self.on_checkpoint_selected(checkpoints[0])
 
     def on_checkpoint_selected(self, name):
-        if name == "None": self.eval_button.configure(state="disabled"); self.tune_button.configure(state="disabled"); self.eval_track_menu.configure(values=["None"]); return
+        if name == "None": self.tune_single_track_button.configure(state="disabled"); self.eval_button.configure(state="disabled"); self.tune_button.configure(state="disabled"); self.eval_track_menu.configure(values=["None"]); return
         self.eval_button.configure(state="normal"); self.tune_button.configure(state="normal")
+        self.tune_single_track_button.configure(state="normal")
         try:
             with open(os.path.join("checkpoints", name, "config.json"), 'r') as f: chk_config = json.load(f)
             eval_dataset_name = chk_config['data_params']['eval_dataset']
@@ -1010,19 +1557,37 @@ class SalienceStudioApp(ctk.CTk):
 
     def update_config_from_ui(self):
         """Update the main config dictionary from the UI widgets before a run."""
-        
-        # Data Params
-        self.config['data_params']['train_dataset'] = self.train_widgets['train_dataset'].get()
-        # The eval_dataset is linked to the opposite of the train_dataset for simplicity here.
-        self.config['data_params']['eval_dataset'] = "DCS" if self.train_widgets['train_dataset'].get() == "Cantoria" else "Cantoria"
+        # --- READ MODEL ARCHITECTURE ---
+        self.config['model_params']['architecture_name'] = self.train_widgets['architecture_name'].get()
 
-        # Training Params
-        try: self.config['training_params']['learning_rate'] = float(self.train_widgets['learning_rate'].get())
+        # --- READ DATASET CONFIG (CORRECTED LOGIC) ---
+        
+        # This is the new logic to read from the checkboxes
+        selected_train_datasets = [name for name, var in self.train_dataset_checkboxes.items() if var.get() == "on"]
+        self.config['data_params']['train_datasets'] = selected_train_datasets # Note: plural 'datasets'
+        
+        # The old line that caused the error is no longer needed.
+        # self.config['data_params']['train_dataset'] = self.train_widgets['train_dataset'].get() # REMOVED
+
+        # The eval_dataset logic is correct as this widget still exists
+        self.config['data_params']['eval_dataset'] = self.train_widgets['eval_dataset'].get()
+
+        # --- Training Params ---
+        try: 
+            self.config['training_params']['learning_rate'] = float(self.train_widgets['learning_rate'].get())
         except (ValueError, TypeError): pass # Keep default if entry is empty/invalid
-        try: self.config['training_params']['num_epochs'] = int(self.train_widgets['num_epochs'].get())
+        try: 
+            self.config['training_params']['num_epochs'] = int(self.train_widgets['num_epochs'].get())
         except (ValueError, TypeError): pass
-        try: self.config['training_params']['batch_size'] = int(self.train_widgets['batch_size'].get())
+        try: 
+            self.config['training_params']['batch_size'] = int(self.train_widgets['batch_size'].get())
         except (ValueError, TypeError): pass
+        
+        # You might want to add entries for the new step-based training parameters here too
+        # Example:
+        # try:
+        #     self.config['training_params']['steps_per_checkpoint'] = int(self.train_widgets['steps_per_checkpoint'].get())
+        # except (ValueError, TypeError): pass
         
         self.log("Configuration updated from UI settings.")
     
@@ -1055,8 +1620,5 @@ if __name__ == '__main__':
     if not os.path.exists(args.dataset_root):
         print(f"Error: Dataset root path does not exist: {args.dataset_root}"); sys.exit(1)
     
-    # NOTE: The UI widget creation for the Train and Tune tabs is condensed for brevity.
-    # In a real application, you would create CTkEntry, CTkSlider, etc. for each parameter
-    # and link them to the update_config_from_ui method.
     app = SalienceStudioApp(root_dir=args.dataset_root)
     app.mainloop()
