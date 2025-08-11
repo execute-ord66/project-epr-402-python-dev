@@ -1052,14 +1052,59 @@ class Evaluator:
         return sorted_ref_times, sorted_ref_freqs
     
     def _extract_pitches(self, salience_map, threshold):
-        dp, n_bins = self.config['data_params'], self.config['data_params']['n_octaves'] * self.config['data_params']['bins_per_octave']
+        """
+        Extracts pitch contours from a salience map. It finds the top 4 peaks in each
+        time frame and refines the frequency of each peak by calculating a weighted
+        average of frequencies in a 3-bin neighborhood around the peak.
+        """
+        # --- Basic setup ---
+        dp = self.config['data_params']
+        n_bins = dp['n_octaves'] * dp['bins_per_octave']
         times = librosa.times_like(salience_map, sr=dp['sr'], hop_length=dp['hop_length'])
+        # Get the center frequency for each CQT bin
         freqs = librosa.cqt_frequencies(n_bins=n_bins, fmin=dp['fmin'], bins_per_octave=dp['bins_per_octave'])
+        
         est_times, est_freqs = [], []
+
+        # --- Iterate through each time frame ---
         for t_idx in range(salience_map.shape[1]):
-            peaks, _ = find_peaks(salience_map[:, t_idx], height=threshold)
-            if peaks.size > 0: est_times.extend([times[t_idx]] * len(peaks)); est_freqs.extend(freqs[peaks])
+            # 1. Find all peaks above the given threshold
+            peaks, properties = find_peaks(salience_map[:, t_idx], height=threshold)
+
+            if peaks.size > 0:
+                # 2. Limit to the top 4 most salient peaks
+                peak_heights = properties['peak_heights']
+                # Sort peaks by height (salience) in descending order and take the top 4
+                sorted_peak_indices = np.argsort(peak_heights)[::-1][:4]
+                top_peaks = peaks[sorted_peak_indices]
+
+                # 3. For each of the top peaks, refine the frequency estimate
+                for peak_bin in top_peaks:
+                    # Define the 3-bin neighborhood around the peak bin
+                    # Handle edge cases where the peak is at the lowest or highest bin
+                    start_bin = max(0, peak_bin - 1)
+                    end_bin = min(n_bins, peak_bin + 2) # slice is exclusive at the end
+
+                    # Isolate the salience values and corresponding frequencies in the neighborhood
+                    salience_window = salience_map[start_bin:end_bin, t_idx]
+                    freq_window = freqs[start_bin:end_bin]
+
+                    # Normalize the salience values in the window to act as probabilities/weights
+                    salience_sum = salience_window.sum()
+                    if salience_sum > 1e-9: # Avoid division by zero
+                        weights = salience_window / salience_sum
+                        # Calculate the refined frequency as a weighted average
+                        refined_freq = np.sum(weights * freq_window)
+                    else:
+                        # Fallback to the center frequency if saliences are all zero (highly unlikely for a peak)
+                        refined_freq = freqs[peak_bin]
+
+                    # Append the time and the newly refined frequency
+                    est_times.append(times[t_idx])
+                    est_freqs.append(refined_freq)
+
         return np.array(est_times), np.array(est_freqs)
+    
     def evaluate_track(self, track_stems, root_dir, threshold):
         self.log(f"Evaluating: {', '.join(track_stems)} @ thresh {threshold:.2f}")
         processor = DataProcessor(self.config, root_dir, "./cache", self.log)
