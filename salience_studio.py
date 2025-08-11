@@ -48,17 +48,17 @@ def get_default_config():
             "architecture_name": "SalienceNetV1",
             "input_channels": 5, # Should match len(harmonics)
             "layers": [
-                {"type": "conv", "filters": 32, "kernel": 5, "padding": 2},
-                {"type": "conv", "filters": 32, "kernel": 5, "padding": 2},
-                {"type": "conv", "filters": 32, "kernel": 5, "padding": 2},
-                {"type": "conv", "filters": 32, "kernel": (69, 5), "padding": (34, 2)},
-                {"type": "conv", "filters": 32, "kernel": (69, 5), "padding": (34, 2)},
+                {"type": "conv", "filters": 8, "kernel": 5, "padding": 2},
+                {"type": "conv", "filters": 8, "kernel": 5, "padding": 2},
+                {"type": "conv", "filters": 8, "kernel": 5, "padding": 2},
+                {"type": "conv", "filters": 8, "kernel": (69, 5), "padding": (34, 2)},
+                {"type": "conv", "filters": 8, "kernel": (69, 5), "padding": (34, 2)},
                 {"type": "conv_out", "filters": 1, "kernel": 1},
             ], "activation": "GELU"
         },
         "training_params": {
-            "learning_rate": 1e-3, "batch_size": 32, "num_epochs": 30,
-            "optimizer": "AdamW", "patch_width": 50, "patch_overlap": 0.5, "val_split_ratio": 0.15,
+            "learning_rate": 1e-3, "batch_size": 20, "num_epochs": 30,
+            "optimizer": "AdamW", "patch_width": 50, "patch_overlap": 0.5, "val_split_ratio": 0.1,
         },
         "evaluation_params": {"eval_batch_size": 8, "peak_threshold": 0.3},
         "tuning_params": {
@@ -285,8 +285,11 @@ class DataProcessor:
         except FileNotFoundError: pass
         self.log(f"Warning: Could not determine dataset folder for stem '{stem_name}'.")
         return ""
-
-    # In the DataProcessor class
+    
+    def hz_to_cqt_bin(self, freq_hz, fmin, bins_per_octave):
+        # safe guard for zeros
+        freq_hz = np.maximum(freq_hz, 1e-12)
+        return bins_per_octave * np.log2(freq_hz / fmin)
 
     def process_and_cache_group(self, track_stems):
         """
@@ -351,61 +354,155 @@ class DataProcessor:
         hcqt = np.stack([c[:, :min_time] for c in cqt_list])
         log_hcqt = (1.0/80.0) * librosa.amplitude_to_db(np.abs(hcqt), ref=np.max) + 1.0
 
-        # --- GROUND TRUTH F0 MAP (ROBUST VERSION) ---
+        # --- GROUND TRUTH F0 MAP with supersampling & average pooling ---
         n_frames = log_hcqt.shape[2]
-        frame_times = librosa.frames_to_time(np.arange(n_frames), sr=self.dp['sr'], hop_length=self.dp['hop_length'])
-        cq_freqs = librosa.cqt_frequencies(n_bins=self.n_bins, fmin=self.dp['fmin'], bins_per_octave=self.dp['bins_per_octave'])
-        f0_map = np.zeros((self.n_bins, n_frames), dtype=np.float32)
+        frame_times = librosa.frames_to_time(
+            np.arange(n_frames), sr=self.dp['sr'], hop_length=self.dp['hop_length']
+        )
+        cq_freqs = librosa.cqt_frequencies(
+            n_bins=self.n_bins, fmin=self.dp['fmin'], bins_per_octave=self.dp['bins_per_octave']
+        )
+
+        # Supersample factors (freq & time)
+        SS_F = 4  # frequency upsampling
+        SS_T = 4  # time upsampling
+
+        hi_n_bins = self.n_bins * SS_F
+        hi_n_frames = n_frames * SS_T
+
+        # High-res canvas that accumulates all stems
+        f0_map_hi = np.zeros((hi_n_bins, hi_n_frames), dtype=np.float32)
+
         total_active_frames = 0
 
         for stem in valid_stems_for_f0:
             is_choralsynth_style = os.sep in stem
-            interp_freqs = None # Initialize to avoid reference before assignment
+
+            interp_freqs = None
             active_mask = None
 
             if is_choralsynth_style:
                 crepe_path = os.path.join(self.root_dir, "ChoralSynth", f"{stem}.f0.csv")
-                if not os.path.exists(crepe_path): continue
-                
+                if not os.path.exists(crepe_path):
+                    continue
+
                 crepe_df = pd.read_csv(crepe_path)
                 crepe_df.columns = [c.strip() for c in crepe_df.columns]
-                
+
                 interp_freqs = np.interp(frame_times, crepe_df['time'], crepe_df['frequency'], left=0, right=0)
                 interp_confidence = np.interp(frame_times, crepe_df['time'], crepe_df['confidence'], left=0, right=0)
                 active_mask = (interp_freqs >= self.dp['fmin']) & (interp_confidence > 0.5)
             else:
                 dataset_folder = self.get_dataset_folder(stem)
-                if not dataset_folder: continue
+                if not dataset_folder:
+                    continue
                 base_path = os.path.join(self.root_dir, dataset_folder)
                 crepe_path = os.path.join(base_path, "F0_crepe", f"{stem}.csv")
                 pyin_path = os.path.join(base_path, "F0_pyin", f"{stem}.csv")
-                if not os.path.exists(crepe_path) or not os.path.exists(pyin_path): continue
-                
+                if not os.path.exists(crepe_path) or not os.path.exists(pyin_path):
+                    continue
+
                 crepe_df = pd.read_csv(crepe_path)
                 crepe_df.columns = [c.strip() for c in crepe_df.columns]
                 pyin_df = pd.read_csv(pyin_path, header=None, names=['time', 'frequency', 'confidence'])
-                
+
                 interp_freqs = np.interp(frame_times, crepe_df['time'], crepe_df['frequency'], left=0, right=0)
                 pyin_voiced_mask = (pyin_df['frequency'] > 0).astype(float)
                 interp_voiced = np.interp(frame_times, pyin_df['time'], pyin_voiced_mask, left=0, right=0)
                 active_mask = (interp_freqs >= self.dp['fmin']) & (interp_voiced > 0.5)
 
-            if active_mask is not None and np.any(active_mask):
-                frame_idxs = np.where(active_mask)[0]
-                bin_idxs = np.argmin(np.abs(interp_freqs[active_mask, None] - cq_freqs[None, :]), axis=1)
-                f0_map[bin_idxs, frame_idxs] = 1.0
-                total_active_frames += len(frame_idxs)
-        
+            if interp_freqs is None or active_mask is None:
+                continue
+
+            total_active_frames += int(np.sum(active_mask))
+
+            # Convert to continuous CQT bin positions (base resolution)
+            bin_pos = self.hz_to_cqt_bin(interp_freqs, self.dp['fmin'], self.dp['bins_per_octave'])
+            # Clamp to valid range to avoid NaNs or infs later
+            bin_pos = np.clip(bin_pos, 0.0, self.n_bins - 1e-6)
+
+            # For each adjacent frame pair, draw a (possibly short) line segment on the high-res canvas
+            # by sampling SS_T sub-steps between t and t+1 (supersampled time).
+            for t0 in range(n_frames - 1):
+                # If neither end is active, skip (keeps map sparse and clean)
+                if not (active_mask[t0] or active_mask[t0 + 1]):
+                    continue
+
+                b0 = bin_pos[t0]
+                b1 = bin_pos[t0 + 1]
+                # High-res time indices for this interval [t0, t0+1)
+                # We fill t0*SS_T .. (t0+1)*SS_T - 1
+                hi_t_start = t0 * SS_T
+                hi_t_end = (t0 + 1) * SS_T
+
+                # Linear interpolation in time across the interval
+                for hi_t in range(hi_t_start, hi_t_end):
+                    u = (hi_t - hi_t_start) / float(SS_T)  # in [0, 1)
+                    # Interpolate activity (soft) and frequency
+                    # Soft activity allows brief gaps to still draw a faint link; harden with >0.5
+                    act = (1.0 - u) * float(active_mask[t0]) + u * float(active_mask[t0 + 1])
+                    if act <= 0.5:
+                        continue
+
+                    b = b0 + u * (b1 - b0)  # continuous base-res bin
+                    # Map to high-res bin
+                    hi_b = int(round(b * SS_F))
+                    if 0 <= hi_b < hi_n_bins:
+                        f0_map_hi[hi_b, hi_t] = 1.0  # stamp a thin line pixel
+
+            # Also consider the very last frame (t = n_frames - 1)
+            if active_mask[-1]:
+                b_last = bin_pos[-1]
+                hi_b_last = int(round(b_last * SS_F))
+                hi_t_last = (n_frames - 1) * SS_T
+                if 0 <= hi_b_last < hi_n_bins and 0 <= hi_t_last < hi_n_frames:
+                    f0_map_hi[hi_b_last, hi_t_last] = 1.0
+
         if total_active_frames == 0:
             self.log(f"  - WARNING: No active frames found for this group. Ground truth will be all zeros.")
         else:
             self.log(f"  - Found {total_active_frames} active pitch frames for this group.")
 
-        # --- GAUSSIAN SMOOTHING & NORMALIZATION ---
-        f0_map = gaussian_filter(f0_map, sigma=(self.dp['gaussian_sigma'], 0), mode='constant')
-        if f0_map.max() > 0:
-            f0_map /= f0_map.max()
-        
+        # --- GAUSSIAN SMOOTHING, DOWNSAMPLING & CLIPPING ---
+        f0_map_hi = gaussian_filter(f0_map_hi, sigma=(self.dp['gaussian_sigma']*2, 0.5), mode='constant')
+        row_max = f0_map_hi.max(axis=1, keepdims=True)
+        row_max[row_max == 0] = 1.0
+        f0_map_hi = f0_map_hi / row_max
+        # --- Average-pool (SS_F x SS_T) back down to (n_bins, n_frames)
+        if hi_n_bins > 0 and hi_n_frames > 0:
+            # reshape to (n_bins, SS_F, n_frames, SS_T) then mean over the SS axes
+            try:
+                f0_map = f0_map_hi.reshape(self.n_bins, SS_F, n_frames, SS_T).mean(axis=(1, 3))
+            except ValueError:
+                # Fallback in case shapes are off due to edge rounding (shouldn't happen)
+                f0_map = np.zeros((self.n_bins, n_frames), dtype=np.float32)
+                self.log("  - WARNING: Supersample reshape failed; produced empty f0_map.")
+        else:
+            f0_map = np.zeros((self.n_bins, n_frames), dtype=np.float32)
+
+        # Small temporal smoothing helps connect sparse pixels after supersampling.
+        # f0_map = gaussian_filter(f0_map, sigma=(self.dp['gaussian_sigma'], 0.5), mode='constant')
+        # Clip and normalize
+        f0_map = np.clip(f0_map, 0.0, 1.0)
+        # # Per-frequency peak normalization
+        for t_idx in range(f0_map.shape[1]):
+            # Find peaks in this time slice (frequency axis)
+            peaks, _ = find_peaks(f0_map[:, t_idx])
+            for p in peaks:
+                peak_val = f0_map[p, t_idx]
+                if peak_val <= 0:
+                    continue
+                scale = 1.0 / peak_val
+
+                # Clamp frequency index range to neighbors
+                r0 = max(0, p - 1)
+                r1 = min(f0_map.shape[0], p + 2)  # +2 because Python slices exclude end
+                f0_map[r0:r1, t_idx] *= scale
+
+                # Clip to 1.0 in case scaling overshoots
+                f0_map[r0:r1, t_idx] = np.minimum(f0_map[r0:r1, t_idx], 1.0)
+
+        # --- Save ---
         np.savez_compressed(cache_path, log_hcqt=log_hcqt, f0_map=f0_map)
         return cache_path
 
@@ -1315,8 +1412,11 @@ class SalienceStudioApp(ctk.CTk):
         self.tune_single_track_button = ctk.CTkButton(settings_frame, text="Tune Threshold for This Track", command=self.start_single_track_tuning_thread, state="disabled")
         self.tune_single_track_button.pack(fill="x", padx=10, pady=10)
 
-        self.tune_button = ctk.CTkButton(settings_frame, text="Auto-Tune Threshold", command=self.start_tuning_thread, state="disabled")
-        self.tune_button.pack(fill="x", padx=10, pady=(0,20))
+        self.tune_button = ctk.CTkButton(settings_frame, text="Auto-Tune Threshold (All Tracks)", command=self.start_tuning_thread, state="disabled")
+        self.tune_button.pack(fill="x", padx=10, pady=(0,10))
+        
+        self.eval_full_dataset_button = ctk.CTkButton(settings_frame, text="Evaluate Full Dataset", command=self.start_full_dataset_evaluation_thread, state="disabled")
+        self.eval_full_dataset_button.pack(fill="x", padx=10, pady=(0, 20))
 
         self.eval_progress_bar = ctk.CTkProgressBar(settings_frame)
         self.eval_progress_bar.set(0)
@@ -1415,7 +1515,6 @@ class SalienceStudioApp(ctk.CTk):
         eval_dataset_name = evaluator.config['data_params']['eval_dataset']
         # --- PASS THE ENTIRE DICTIONARY OF TRACKS ---
         all_tracks_for_eval = self.data_manager.track_groups[eval_dataset_name]
-        print("all tracks", all_tracks_for_eval)
 
         if not all_tracks_for_eval:
             self.log(f"ERROR: No tracks found in the evaluation dataset '{eval_dataset_name}'. Cannot tune threshold.")
@@ -1459,6 +1558,103 @@ class SalienceStudioApp(ctk.CTk):
         self.tune_single_track_button.configure(state="disabled")
         self.tune_button.configure(state="disabled")
 
+    def start_full_dataset_evaluation_thread(self):
+        """Starts a thread to evaluate the model on the entire evaluation dataset."""
+        try:
+            threshold = float(self.threshold_entry.get())
+        except (ValueError, TypeError):
+            threshold = 0.3  # Use default if empty or invalid
+        
+        checkpoint_name = self.checkpoint_menu.get()
+        if checkpoint_name == "None":
+            self.log("ERROR: No checkpoint selected for evaluation.")
+            return
+            
+        checkpoint_path = os.path.join("checkpoints", checkpoint_name)
+        
+        self.log(f"Starting full dataset evaluation for model: {checkpoint_name}")
+        
+        # Disable buttons
+        self.eval_button.configure(state="disabled")
+        self.tune_button.configure(state="disabled")
+        self.tune_single_track_button.configure(state="disabled")
+        self.eval_full_dataset_button.configure(state="disabled")
+
+        # The worker function will need access to the evaluator and track info
+        evaluator = Evaluator(checkpoint_path, self.device, self.log_threadsafe, self.eval_progress_threadsafe)
+        eval_dataset_name = evaluator.config['data_params']['eval_dataset']
+        all_tracks_for_eval = self.data_manager.track_groups[eval_dataset_name]
+
+        if not all_tracks_for_eval:
+            self.log(f"ERROR: No tracks found in the evaluation dataset '{eval_dataset_name}'.")
+            self.handle_full_evaluation_completion(None) # Re-enable buttons
+            return
+
+        threading.Thread(target=self.run_full_dataset_evaluation,
+                         args=(evaluator, all_tracks_for_eval, threshold, checkpoint_path),
+                         daemon=True).start()
+
+    def run_full_dataset_evaluation(self, evaluator, all_tracks_for_eval, threshold, checkpoint_path):
+        """Worker thread to perform evaluation, calculate stats, and save plots/scores."""
+        # Create a unique results folder
+        results_dir = os.path.join(checkpoint_path, f"evaluation_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        plots_dir = os.path.join(results_dir, "pitch_plots")
+        os.makedirs(plots_dir, exist_ok=True)
+        
+        self.log_threadsafe(f"Results will be saved in: {results_dir}")
+
+        all_scores = []
+        track_items = list(all_tracks_for_eval.items()) # To get track names and stems
+        num_tracks = len(track_items)
+
+        for i, (track_id, track_stems) in enumerate(track_items):
+            self.log_threadsafe(f"--- Evaluating track {i+1}/{num_tracks}: {track_id} ---")
+            
+            scores, ref_data, est_data = evaluator.evaluate_track(track_stems, self.root_dir, threshold)
+            
+            score_entry = {'track_id': track_id, **scores}
+            all_scores.append(score_entry)
+            
+            # Sanitize filename for PDF
+            sanitized_track_id = track_id.replace(os.sep, '_').replace('/', '_')
+            plot_filename = f"{sanitized_track_id}.pdf"
+            plot_filepath = os.path.join(plots_dir, plot_filename)
+            self._save_plot_to_pdf(ref_data, est_data, track_id, plot_filepath)
+            
+            self.eval_progress_threadsafe(i + 1, num_tracks)
+
+        self.log_threadsafe("--- Full dataset evaluation finished. Calculating statistics. ---")
+
+        if all_scores:
+            df = pd.DataFrame(all_scores)
+            stats = {}
+            for metric in ['F1-score', 'Precision', 'Recall', 'Accuracy']:
+                description = df[metric].describe()
+                stats[metric] = {
+                    'mean': description.get('mean', 0), 'std': description.get('std', 0),
+                    'min': description.get('min', 0), 'q1': description.get('25%', 0),
+                    'median': description.get('50%', 0), 'q3': description.get('75%', 0),
+                    'max': description.get('max', 0)
+                }
+            
+            results_data = {
+                'model_checkpoint_hash': os.path.basename(checkpoint_path),
+                'evaluation_timestamp': datetime.now().isoformat(),
+                'threshold_used': threshold,
+                'box_plot_statistics': stats,
+                'track_by_track_scores': all_scores
+            }
+            results_filepath = os.path.join(results_dir, "summary_scores.json")
+            try:
+                with open(results_filepath, 'w') as f:
+                    json.dump(results_data, f, indent=4)
+                self.log_threadsafe(f"Successfully saved summary statistics to {results_filepath}")
+            except Exception as e:
+                self.log_threadsafe(f"ERROR: Failed to save summary file. Reason: {e}")
+        else:
+            self.log_threadsafe("WARNING: No scores were generated, summary file not created.")
+
+        self.ui_queue.put(("full_evaluation_complete", results_dir))
 
     def start_hp_tuning_thread(self):
         self.update_tuning_config_from_ui()
@@ -1480,6 +1676,8 @@ class SalienceStudioApp(ctk.CTk):
             elif message == "evaluation_complete": self.handle_evaluation_completion(data)
             elif message == "tuning_complete": self.handle_tuning_completion(data)
             elif message == "hp_tuning_complete": self.handle_hp_tuning_completion(data)
+            elif message == "full_evaluation_complete": self.handle_full_evaluation_completion(data)
+
         self.after(100, self.check_ui_queue)
 
     def handle_epoch_completion(self, metrics):
@@ -1495,11 +1693,6 @@ class SalienceStudioApp(ctk.CTk):
         self.plot_training_loss(metrics) # Final plot update
         self.refresh_checkpoints()
 
-    def handle_training_completion(self, data):
-        checkpoint_dir, metrics = data; self.log(f"Training run completed. Results in {checkpoint_dir}")
-        self.train_button.configure(state="normal", text="Start Training"); self.progress_bar.set(0)
-        self.plot_training_loss(metrics); self.refresh_checkpoints()
-
     def handle_evaluation_completion(self, data):
         scores, ref_data, est_data = data; self.plot_evaluation_result(ref_data, est_data)
         self.eval_button.configure(state="normal"); self.tune_button.configure(state="normal"); self.tune_single_track_button.configure(state="normal"); self.eval_progress_bar.set(0)
@@ -1512,12 +1705,24 @@ class SalienceStudioApp(ctk.CTk):
         history = data; self.plot_tuning_history(history)
         self.tune_run_button.configure(state="normal"); self.tune_progress_bar.set(0)
 
+    def handle_full_evaluation_completion(self, results_dir):
+        """Handles the UI update after a full dataset evaluation is complete."""
+        if results_dir:
+            self.log(f"Full dataset evaluation is complete. Results saved in {results_dir}")
+        # Re-enable all evaluation buttons
+        self.eval_button.configure(state="normal")
+        self.tune_button.configure(state="normal")
+        self.tune_single_track_button.configure(state="normal")
+        self.eval_full_dataset_button.configure(state="normal")
+        self.eval_progress_bar.set(0)
+
+
     # --- Plotting methods ---
     def plot_training_loss(self, metrics):
         if self.train_canvas_widget: self.train_canvas_widget.get_tk_widget().destroy()
         fig, ax = plt.subplots(figsize=(6, 4), facecolor="#2B2B2B"); ax.plot(metrics['train_loss'], label='Train Loss', color="#1F6AA5"); ax.plot(metrics['val_loss'], label='Val Loss', color="#FFA500")
         ax.set_title("Training History", color="white"); ax.set_xlabel("Epoch", color="white"); ax.set_ylabel("Loss", color="white"); ax.legend(); ax.grid(True, linestyle=':', color='gray'); ax.tick_params(axis='x', colors='white'); ax.tick_params(axis='y', colors='white'); fig.tight_layout()
-        canvas = FigureCanvasTkAgg(fig, master=self.train_viz_frame); self.train_canvas_widget = canvas; canvas.draw(); canvas.get_tk_widget().pack(side=ctk.TOP, fill=ctk.BOTH, expand=1)
+        canvas = FigureCanvasTkAgg(fig, master=self.train_viz_frame); self.train_canvas_widget = canvas; canvas.draw(); canvas.get_tk_widget().pack(side=ctk.TOP, fill=ctk.BOTH, expand=1); plt.close(fig)
 
     def plot_evaluation_result(self, ref_data, est_data):
         if self.eval_canvas_widget: self.eval_canvas_widget.get_tk_widget().destroy()
@@ -1528,7 +1733,33 @@ class SalienceStudioApp(ctk.CTk):
         ax.set_yscale('log'); ax.set_yticks([128, 256, 512, 1024], labels=['128', '256', '512', '1024']); ax.set_ylabel('Frequency (Hz)', color='white'); ax.set_xlabel('Time (s)', color='white')
         ax.set_title("Pitch Estimation Result", color="white"); ax.legend(); ax.grid(True, linestyle=':', color='gray'); ax.tick_params(axis='x', colors='white'); ax.tick_params(axis='y', colors='white')
         if ref_times.size > 0: ax.set_xlim(ref_times.min() - 1, ref_times.max() + 1); ax.set_ylim(bottom=60)
-        fig.tight_layout(); canvas = FigureCanvasTkAgg(fig, master=self.eval_viz_frame); self.eval_canvas_widget = canvas; canvas.draw(); canvas.get_tk_widget().pack(side=ctk.TOP, fill=ctk.BOTH, expand=1)
+        fig.tight_layout(); canvas = FigureCanvasTkAgg(fig, master=self.eval_viz_frame); self.eval_canvas_widget = canvas; canvas.draw(); canvas.get_tk_widget().pack(side=ctk.TOP, fill=ctk.BOTH, expand=1); plt.close(fig)
+
+    def _save_plot_to_pdf(self, ref_data, est_data, track_name, output_path):
+        """Saves a pitch estimation plot to a PDF file. Designed to be thread-safe."""
+        ref_times, ref_freqs = ref_data; est_times, est_freqs = est_data
+        
+        fig, ax = plt.subplots(figsize=(10, 6), facecolor="#FFFFFF") # Use white background for PDF
+        
+        if ref_times.size > 0: ax.scatter(ref_times, ref_freqs, c='black', marker='.', s=50, label='Reference', zorder=2)
+        if est_times.size > 0: ax.scatter(est_times, est_freqs, c='#e60000', marker='.', s=25, alpha=0.7, label='Prediction', zorder=3)
+            
+        ax.set_yscale('log'); ax.set_yticks([128, 256, 512, 1024], labels=['128', '256', '512', '1024']); ax.set_ylabel('Frequency (Hz)'); ax.set_xlabel('Time (s)')
+        ax.set_title(f"Pitch Estimation for: {track_name}"); ax.legend(); ax.grid(True, linestyle=':', color='gray')
+        
+        if ref_times.size > 0 and ref_times.max() > ref_times.min():
+            ax.set_xlim(ref_times.min() - 1, ref_times.max() + 1)
+        ax.set_ylim(bottom=60)
+            
+        fig.tight_layout()
+        
+        try:
+            fig.savefig(output_path, format='pdf')
+            self.log_threadsafe(f"  > Saved plot to {os.path.basename(output_path)}")
+        except Exception as e:
+            self.log_threadsafe(f"  > ERROR: Failed to save plot to {output_path}. Reason: {e}")
+        finally:
+            plt.close(fig) # Important: release memory
 
     def plot_tuning_history(self, history):
         if self.tune_canvas_widget: self.tune_canvas_widget.get_tk_widget().destroy()
@@ -1544,16 +1775,27 @@ class SalienceStudioApp(ctk.CTk):
         self.checkpoint_menu.configure(values=checkpoints); self.on_checkpoint_selected(checkpoints[0])
 
     def on_checkpoint_selected(self, name):
-        if name == "None": self.tune_single_track_button.configure(state="disabled"); self.eval_button.configure(state="disabled"); self.tune_button.configure(state="disabled"); self.eval_track_menu.configure(values=["None"]); return
-        self.eval_button.configure(state="normal"); self.tune_button.configure(state="normal")
-        self.tune_single_track_button.configure(state="normal")
+        is_none = (name == "None")
+        state = "disabled" if is_none else "normal"
+        
+        self.eval_button.configure(state=state)
+        self.tune_button.configure(state=state)
+        self.tune_single_track_button.configure(state=state)
+        self.eval_full_dataset_button.configure(state=state)
+
+        if is_none:
+            self.eval_track_menu.configure(values=["None"])
+            return
+            
         try:
             with open(os.path.join("checkpoints", name, "config.json"), 'r') as f: chk_config = json.load(f)
             eval_dataset_name = chk_config['data_params']['eval_dataset']
             track_ids = list(self.data_manager.track_groups[eval_dataset_name].keys())
             if not track_ids: track_ids = ["None"]
             self.eval_track_menu.configure(values=track_ids); self.eval_track_menu.set(random.choice(track_ids))
-        except Exception as e: self.log(f"Error loading checkpoint config: {e}")
+        except Exception as e: 
+            self.log(f"Error loading checkpoint config: {e}")
+            self.eval_track_menu.configure(values=["None"])
 
     def update_config_from_ui(self):
         """Update the main config dictionary from the UI widgets before a run."""
