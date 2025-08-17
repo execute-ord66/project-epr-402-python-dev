@@ -24,6 +24,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from tqdm import tqdm
 from scipy.ndimage import gaussian_filter
 from scipy.signal import find_peaks
+from scipy.io import wavfile
+from scipy.optimize import linear_sum_assignment
 import mir_eval
 import customtkinter as ctk
 import hashlib 
@@ -40,25 +42,26 @@ def get_default_config():
     return {
         "run_id": None,
         "data_params": {
-            "sr": 22050, "hop_length": 256, "fmin": 32.7, "harmonics": [1, 2, 3, 4, 5],
+            "sr": 22050, "hop_length": 256, "fmin": 32.703, "harmonics": [1, 2, 3, 4, 5],
             "bins_per_octave": 60, "n_octaves": 6, "gaussian_sigma": 1.0,
             "train_dataset": "Cantoria", "eval_dataset": "DCS",
         },
         "model_params": {
-            "architecture_name": "SalienceNetV1",
+            "architecture_name": "SalienceNetV2",
             "input_channels": 5, # Should match len(harmonics)
             "layers": [
-                {"type": "conv", "filters": 8, "kernel": 5, "padding": 2},
-                {"type": "conv", "filters": 8, "kernel": 5, "padding": 2},
-                {"type": "conv", "filters": 8, "kernel": 5, "padding": 2},
-                {"type": "conv", "filters": 8, "kernel": (69, 5), "padding": (34, 2)},
-                {"type": "conv", "filters": 8, "kernel": (69, 5), "padding": (34, 2)},
+                {"type": "conv_in", "filters": 16, "kernel": 5, "padding": 2},
+                {"type": "conv", "filters": 16, "kernel": 5, "padding": 2},
+                {"type": "conv", "filters": 16, "kernel": 5, "padding": 2},
+                {"type": "conv", "filters": 16, "kernel": 5, "padding": 2},
+                {"type": "conv", "filters": 16, "kernel": (69, 5), "padding": (34, 2)},
                 {"type": "conv_out", "filters": 1, "kernel": 1},
             ], "activation": "GELU"
         },
         "training_params": {
-            "learning_rate": 1e-3, "batch_size": 20, "num_epochs": 30,
+            "learning_rate": 2e-3, "batch_size": 22, "num_epochs": 40,
             "optimizer": "AdamW", "patch_width": 50, "patch_overlap": 0.5, "val_split_ratio": 0.1,
+            "weight_decay": 0.1
         },
         "evaluation_params": {"eval_batch_size": 8, "peak_threshold": 0.3},
         "tuning_params": {
@@ -93,9 +96,26 @@ def get_config_hash(config):
     # Calculate and return the SHA-256 hash
     return hashlib.sha256(config_string.encode('utf-8')).hexdigest()[:16] # Use first 16 chars for a shorter, manageable folder name
 
+
+
 # -----------------------------------------------------------------------------
 # SECTION 2: MODELS, LOSS, & METRICS
 # -----------------------------------------------------------------------------
+
+class ParabolicCone(nn.Module):
+    def forward(self, input):
+        return input * (2 - input)
+
+class Cone(nn.Module):
+    def forward(self, input):
+        return 1-torch.abs(input-1)
+    
+ACTIVATIONS = {
+    "GELU": nn.GELU,
+    "ParabolicCone": ParabolicCone,
+    "Cone": ParabolicCone,
+    "ReLU": nn.ReLU,
+}
 
 class SalienceCNN(nn.Module):
     def __init__(self, config):
@@ -103,11 +123,15 @@ class SalienceCNN(nn.Module):
         model_cfg = config['model_params']
         layers = []
         in_channels = model_cfg['input_channels']
-        activation_fn = nn.GELU() if model_cfg.get("activation", "GELU") == "GELU" else nn.ReLU()
-        for layer_cfg in model_cfg['layers']:
+
+        # Get the activation function from the dictionary
+        activation_name = model_cfg.get("activation", "GELU")
+        activation_fn = ACTIVATIONS[activation_name]()
+
+        for i, layer_cfg in enumerate(model_cfg['layers']):
             out_channels, kernel, padding = layer_cfg['filters'], layer_cfg['kernel'], layer_cfg.get('padding', 'same')
             layers.append(nn.Conv2d(in_channels, out_channels, kernel, padding=padding))
-            if layer_cfg['type'] != "conv_out":
+            if layer_cfg['type'] != "conv_out" and layer_cfg['type'] != "conv_in":
                 layers.extend([nn.BatchNorm2d(out_channels), activation_fn])
             in_channels = out_channels
         layers.append(nn.Sigmoid())
@@ -194,6 +218,7 @@ class ConvNeXt_Tiny(nn.Module):
 # Place this dictionary right after your model class definitions
 MODEL_REGISTRY = {
     "SalienceNetV1": SalienceCNN,
+    "SalienceNetV2": SalienceCNN,
     "ConvNeXt_Tiny": ConvNeXt_Tiny
 }
 
@@ -409,7 +434,8 @@ class DataProcessor:
                 interp_freqs = np.interp(frame_times, crepe_df['time'], crepe_df['frequency'], left=0, right=0)
                 pyin_voiced_mask = (pyin_df['frequency'] > 0).astype(float)
                 interp_voiced = np.interp(frame_times, pyin_df['time'], pyin_voiced_mask, left=0, right=0)
-                active_mask = (interp_freqs >= self.dp['fmin']) & (interp_voiced > 0.5)
+                interp_confidence = np.interp(frame_times, crepe_df['time'], crepe_df['confidence'], left=0, right=0)
+                active_mask = (interp_freqs >= self.dp['fmin']) & (interp_voiced > 0.5) & (crepe_df['confidence'] > 0.5)
 
             if interp_freqs is None or active_mask is None:
                 continue
@@ -795,7 +821,7 @@ class Trainer:
         
         model_class = MODEL_REGISTRY[model_name]
         model = model_class(self.config).to(self.device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=self.config['training_params']['learning_rate'])
+        optimizer = torch.optim.AdamW(model.parameters(), lr=self.config['training_params']['learning_rate'], weight_decay=self.config['training_params']['weight_decay'])
         criterion = bkld_loss
 
         self.log(f"Model: '{model_name}' created with {sum(p.numel() for p in model.parameters()):,} parameters.")
@@ -963,46 +989,89 @@ class Evaluator:
 
         model_class = MODEL_REGISTRY[model_name]
         self.model = model_class(self.config).to(self.device)
-        # --- END OF CHANGE ---
 
         self.model.load_state_dict(torch.load(model_path, map_location=device))
         self.model.eval()
         self.log(f"Evaluator ready. Loaded model '{model_name}' from {checkpoint_path}")
 
-    def _run_inference(self, audio_mix):
-        dp, tp, n_bins = self.config['data_params'], self.config['training_params'], self.config['data_params']['n_octaves'] * self.config['data_params']['bins_per_octave']
-        cqt_list = [librosa.cqt(audio_mix, sr=dp['sr'], hop_length=dp['hop_length'], fmin=dp['fmin'] * h, n_bins=n_bins, bins_per_octave=dp['bins_per_octave']) for h in dp['harmonics']]
-        min_time = min(c.shape[1] for c in cqt_list); hcqt = np.stack([c[:, :min_time] for c in cqt_list])
-        log_hcqt = (1.0/80.0) * librosa.amplitude_to_db(np.abs(hcqt), ref=np.max) + 1.0
-        patch_width, n_f = tp['patch_width'], log_hcqt.shape[2]; step = int(patch_width * (1-tp['patch_overlap']))
-        if n_f < patch_width: return np.zeros((n_bins, n_f))
-        patches = np.stack([log_hcqt[:, :, st:st+patch_width] for st in range(0, n_f - patch_width + 1, step)])
-        dataset = TensorDataset(torch.from_numpy(patches).float()); loader = DataLoader(dataset, batch_size=self.config['evaluation_params']['eval_batch_size'], shuffle=False)
-        total_frames = (len(patches) - 1) * step + patch_width; out_map, ov_count = np.zeros((n_bins, total_frames)), np.zeros((n_bins, total_frames))
+    def _run_inference(self, log_hcqt):
+        """
+        Runs model inference on a pre-computed log_hcqt representation.
+
+        This version correctly handles overlapping patches by calculating a true
+        average of their salience values. It uses two maps: one to sum the
+        predictions and another to count the number of contributions for each bin.
+        """
+        tp = self.config['training_params']
+        n_bins = self.config['data_params']['n_octaves'] * self.config['data_params']['bins_per_octave']
+        print(log_hcqt.shape)
+        patch_width, n_f = tp['patch_width'], log_hcqt.shape[2]
+        step = int(patch_width * (1 - tp['patch_overlap']))
+
+        if n_f < patch_width:
+            self.log("Warning: Number of frames is smaller than patch width. Returning empty map.")
+            return np.zeros((n_bins, n_f))
+
+        patches = np.stack([log_hcqt[:, :, st:st + patch_width] for st in range(0, n_f - patch_width + 1, step)])
+        dataset = TensorDataset(torch.from_numpy(patches).float())
+        loader = DataLoader(dataset, batch_size=self.config['evaluation_params']['eval_batch_size'], shuffle=False)
+
+        # The output map's size is determined by the total span of all patches.
+        total_frames = (len(patches) - 1) * step + patch_width
+
+        # --- KEY CHANGE: Use two maps for averaging ---
+        # 1. A map to accumulate the sum of predictions.
+        sum_map = np.zeros((n_bins, total_frames), dtype=np.float32)
+        # 2. A map to count how many patches contributed to each bin.
+        count_map = np.zeros((n_bins, total_frames), dtype=np.float32)
+
         with torch.no_grad():
-            for i, (batch,) in enumerate(tqdm(loader, desc="Inference", leave=False)):
+            for i, (batch,) in enumerate(loader):
+                # Get model predictions, already in [0, 1] from the sigmoid.
                 preds = self.model(batch.to(self.device)).squeeze(1).cpu().numpy()
-                for j, p in enumerate(preds): start_frame = (i * loader.batch_size + j) * step; out_map[:, start_frame:start_frame+patch_width] += p; ov_count[:, start_frame:start_frame+patch_width] += 1
-        ov_count[ov_count == 0] = 1e-6; salience_map = out_map / ov_count
-        if salience_map.max() > 0: salience_map /= salience_map.max()
+                for j, p in enumerate(preds):
+                    start_frame = (i * loader.batch_size + j) * step
+                    end_frame = start_frame + patch_width
+                    
+                    # Add the model's output to the sum map.
+                    sum_map[:, start_frame:end_frame] += p
+                    # Increment the count for the region covered by this patch.
+                    count_map[:, start_frame:end_frame] += 1
+
+        # --- Final Averaging Step ---
+        # To avoid division by zero for any bins that were not covered,
+        # we set their count to 1. Since their sum is also 0, this results in 0.
+        count_map[count_map == 0] = 1.0
+        
+        # Element-wise division to get the final averaged salience map.
+        salience_map = sum_map / count_map
+        
         return salience_map
-    
-    def _get_ground_truth(self, track_stems, root_dir, n_frames):
-        """Reuses DataProcessor logic to get ground truth F0 map."""
+
+    def _get_ground_truth(self, processor, track_stems, root_dir, n_frames):
+        """
+        Gets ground truth (time, frequency) pairs for mir_eval using a robust
+        heuristic to distinguish between dataset path styles.
+        """
         dp = self.config['data_params']
         frame_times = librosa.frames_to_time(np.arange(n_frames), sr=dp['sr'], hop_length=dp['hop_length'])
         
         ref_times_list, ref_freqs_list = [], []
 
         for stem in track_stems:
-            is_choralsynth_style = os.sep in stem
-            interp_freqs = None # Initialize to avoid reference before assignment
+            interp_freqs = None 
             active = None
 
+            # --- START OF THE FIX ---
+            # The reliable heuristic: ChoralSynth stems contain path separators.
+            is_choralsynth_style = os.sep in stem
+
             if is_choralsynth_style:
-                # ChoralSynth F0 file logic
+                # It's a ChoralSynth stem. Construct the path directly.
                 crepe_path = os.path.join(root_dir, "ChoralSynth", f"{stem}.f0.csv")
-                if not os.path.exists(crepe_path): continue
+                if not os.path.exists(crepe_path):
+                    self.log(f"WARN: ChoralSynth F0 file not found at {crepe_path}")
+                    continue
 
                 crepe_df = pd.read_csv(crepe_path)
                 crepe_df.columns = [c.strip() for c in crepe_df.columns]
@@ -1012,15 +1081,17 @@ class Evaluator:
                 active = (interp_freqs >= dp['fmin']) & (interp_confidence > 0.5)
 
             else:
-                # Cantoria/DCS F0 file logic
-                processor = DataProcessor(self.config, root_dir, "./cache", self.log)
+                # It's a Cantoria/DCS style stem. Now it is safe to get the dataset folder.
                 dataset_folder = processor.get_dataset_folder(stem)
-                if not dataset_folder: continue
-
+                if not dataset_folder:
+                    self.log(f"WARN: Could not find dataset folder for stem {stem}. Skipping.")
+                    continue
+                
                 base_path = os.path.join(root_dir, dataset_folder)
                 crepe_path = os.path.join(base_path, "F0_crepe", f"{stem}.csv")
                 pyin_path = os.path.join(base_path, "F0_pyin", f"{stem}.csv")
-                if not os.path.exists(crepe_path) or not os.path.exists(pyin_path): continue
+                if not os.path.exists(crepe_path) or not os.path.exists(pyin_path):
+                    continue
 
                 crepe_df = pd.read_csv(crepe_path)
                 crepe_df.columns = [c.strip() for c in crepe_df.columns]
@@ -1030,26 +1101,19 @@ class Evaluator:
                 pyin_voiced_mask = (pyin_df['frequency'] > 0).astype(float)
                 interp_voiced = np.interp(frame_times, pyin_df['time'], pyin_voiced_mask, left=0, right=0)
                 active = (interp_freqs >= dp['fmin']) & (interp_voiced > 0.5)
+            # --- END OF THE FIX ---
 
             if active is not None and np.any(active):
                 ref_times_list.extend(frame_times[active])
                 ref_freqs_list.extend(interp_freqs[active])
         
-        # Convert to numpy arrays
         ref_times = np.array(ref_times_list)
         ref_freqs = np.array(ref_freqs_list)
-
         if ref_times.size == 0:
-            return ref_times, ref_freqs # Return empty arrays if no pitches found
+            return ref_times, ref_freqs
 
-        # Get the indices that would sort the time array
         sort_indices = np.argsort(ref_times)
-        
-        # Apply these indices to both arrays to sort them together
-        sorted_ref_times = ref_times[sort_indices]
-        sorted_ref_freqs = ref_freqs[sort_indices]
-
-        return sorted_ref_times, sorted_ref_freqs
+        return ref_times[sort_indices], ref_freqs[sort_indices]
     
     def _extract_pitches(self, salience_map, threshold):
         """
@@ -1106,20 +1170,40 @@ class Evaluator:
         return np.array(est_times), np.array(est_freqs)
     
     def evaluate_track(self, track_stems, root_dir, threshold):
-        self.log(f"Evaluating: {', '.join(track_stems)} @ thresh {threshold:.2f}")
+        canonical_name = "_".join(sorted(track_stems))
+        # Create a SHA-1 hash of this string to get a safe, fixed-length filename.
+        group_hash = hashlib.sha1(canonical_name.encode('utf-8')).hexdigest()
+        self.log(f"Evaluating: {', '.join(track_stems)} ({group_hash}) @ thresh {threshold:.2f}")
+        
+        # 1. Use the DataProcessor to ensure the data is cached and get the path.
         processor = DataProcessor(self.config, root_dir, "./cache", self.log)
-        max_len, all_y = 0, []
-        for stem in track_stems:
-            dataset_folder = processor.get_dataset_folder(stem)
-            audio_path = os.path.join(root_dir, dataset_folder, "Audio", f"{stem}.wav")
-            y, _ = librosa.load(audio_path, sr=self.config['data_params']['sr']); all_y.append(y)
-            if len(y) > max_len: max_len = len(y)
-        audio_mix = np.sum([np.pad(y, (0, max_len - len(y))) for y in all_y], axis=0)
-        salience_map = self._run_inference(audio_mix)
-        ref_times, ref_freqs = self._get_ground_truth(track_stems, root_dir, salience_map.shape[1])
+        cache_path = processor.process_and_cache_group(track_stems)
+        
+        if not cache_path or not os.path.exists(cache_path):
+            self.log(f"ERROR: Could not process or find cache for group. Aborting evaluation for this track.")
+            empty_scores = {'F1-score': 0.0, 'Precision': 0.0, 'Recall': 0.0, 'Accuracy': 0.0}
+            empty_data = (np.array([]), np.array([]))
+            return empty_scores, empty_data, empty_data
+
+        # 2. Load the pre-computed log_hcqt from the cache.
+        cached_data = np.load(cache_path)
+        log_hcqt = cached_data['log_hcqt']
+
+        # 3. Run inference on the pre-computed features.
+        salience_map = self._run_inference(log_hcqt)
+
+        # 4. Get ground truth pitches by re-analyzing the original F0 files for mir_eval.
+        ref_times, ref_freqs = self._get_ground_truth(
+            processor, track_stems, root_dir, salience_map.shape[1]
+        )
+
+        # 5. Extract estimated pitches from the salience map.
         est_times, est_freqs = self._extract_pitches(salience_map, threshold)
+
+        # 6. Calculate scores.
         scores = calculate_f1_score(ref_times, ref_freqs, est_times, est_freqs)
         self.log(f"Scores: F1={scores['F1-score']:.3f}, P={scores['Precision']:.3f}, R={scores['Recall']:.3f}")
+        
         return scores, (ref_times, ref_freqs), (est_times, est_freqs)
     
     def tune_threshold(self, all_eval_track_groups, root_dir):
@@ -1132,36 +1216,62 @@ class Evaluator:
         
         processor = DataProcessor(self.config, root_dir, "./cache", self.log)
         
-        # --- Step 1: Pre-compute salience maps (this part remains the same) ---
+        # --- Step 1: Pre-compute salience maps ---
         salience_maps = {}
         ground_truths = {}
+        
+        # Define necessary parameters for CQT calculation
+        dp = self.config['data_params']
+        n_bins = dp['n_octaves'] * dp['bins_per_octave']
         
         track_values = list(all_eval_track_groups.values())
         for i, track_stems in enumerate(tqdm(track_values, desc="Pre-computing Salience Maps", leave=False)):
             group_id = "_".join(sorted(track_stems))
             
+            # --- Audio Mixing (remains the same) ---
             max_len, all_y = 0, []
             for stem in track_stems:
-                dataset_folder = processor.get_dataset_folder(stem)
-                audio_path = os.path.join(root_dir, dataset_folder, "Audio", f"{stem}.wav")
-                y, _ = librosa.load(audio_path, sr=self.config['data_params']['sr'])
+                # This logic is specific to Cantoria/DCS and needs to be more robust
+                # For now, we assume it works for the intended dataset
+                is_choralsynth_style = os.sep in stem
+                if is_choralsynth_style:
+                    # This logic might need adjustment if tuning ChoralSynth tracks
+                    audio_path = os.path.join(self.root_dir, "ChoralSynth", f"{stem}.wav")
+                else:
+                    dataset_folder = processor.get_dataset_folder(stem)
+                    audio_path = os.path.join(root_dir, dataset_folder, "Audio", f"{stem}.wav")
+                
+                if not os.path.exists(audio_path): continue
+                y, _ = librosa.load(audio_path, sr=dp['sr'])
                 all_y.append(y)
                 if len(y) > max_len: max_len = len(y)
+            
+            if not all_y: continue
             audio_mix = np.sum([np.pad(y, (0, max_len - len(y))) for y in all_y], axis=0)
 
-            salience_map = self._run_inference(audio_mix)
+            # --- START: ADDED CQT CALCULATION BLOCK ---
+            # This block was missing. It converts the 1D audio_mix into the 3D log_hcqt.
+            cqt_list = [librosa.cqt(y=audio_mix, sr=dp['sr'], hop_length=dp['hop_length'],
+                                   fmin=dp['fmin'] * h, n_bins=n_bins,
+                                   bins_per_octave=dp['bins_per_octave']) for h in dp['harmonics']]
+            min_time = min(c.shape[1] for c in cqt_list)
+            hcqt = np.stack([c[:, :min_time] for c in cqt_list])
+            log_hcqt = (1.0 / 80.0) * librosa.amplitude_to_db(np.abs(hcqt), ref=np.max) + 1.0
+            # --- END: ADDED CQT CALCULATION BLOCK ---
+
+            # Now, call _run_inference with the CORRECT data type
+            salience_map = self._run_inference(log_hcqt)
             salience_maps[group_id] = salience_map
             
-            ref_times, ref_freqs = self._get_ground_truth(track_stems, root_dir, salience_map.shape[1])
+            ref_times, ref_freqs = self._get_ground_truth(processor, track_stems, root_dir, salience_map.shape[1])
             ground_truths[group_id] = (ref_times, ref_freqs)
             
             self.progress(i + 1, num_tracks)
 
         self.log("All salience maps pre-computed. Starting efficient search...")
 
-        # --- Step 2: Helper function to evaluate a single threshold ---
-        # This avoids code duplication inside the search loop.
-        memo = {} # Memoization to cache results for thresholds we've already seen
+        # --- Step 2 & 3: Ternary Search (this part is unchanged) ---
+        memo = {} 
         def get_avg_f1(thresh):
             if thresh in memo:
                 return memo[thresh]
@@ -1169,6 +1279,7 @@ class Evaluator:
             f1_scores = []
             for track_stems in all_eval_track_groups.values():
                 lookup_id = "_".join(sorted(track_stems))
+                if lookup_id not in salience_maps: continue # Skip if processing failed
                 salience_map = salience_maps[lookup_id]
                 ref_times, ref_freqs = ground_truths[lookup_id]
                 
@@ -1176,42 +1287,23 @@ class Evaluator:
                 scores = calculate_f1_score(ref_times, ref_freqs, est_times, est_freqs)
                 f1_scores.append(scores['F1-score'])
             
+            if not f1_scores: return 0.0 # Avoid error if all tracks failed
             avg_f1 = np.mean(f1_scores)
             self.log(f"  - Testing Threshold {thresh:.4f}: Average F1 = {avg_f1:.4f}")
             memo[thresh] = avg_f1
             return avg_f1
 
-        # --- Step 3: Ternary Search Implementation ---
-        low = 0.1
-        high = 0.8
-        # We can use a fixed number of iterations for simplicity and guaranteed termination
-        # 10 iterations will narrow the range [0.1, 0.8] down to a width of ~0.01
-        iterations = 10 
-
+        low, high, iterations = 0.1, 0.8, 10
         for i in range(iterations):
-            # If the range is already very small, we can stop early
-            if (high - low) < 0.01:
-                break
-                
-            # Update progress bar for search iterations
+            if (high - low) < 0.01: break
             self.progress(i + 1, iterations)
-
-            # Calculate two midpoints
-            m1 = low + (high - low) / 3
-            m2 = high - (high - low) / 3
-            
-            f1_m1 = get_avg_f1(m1)
-            f1_m2 = get_avg_f1(m2)
-
-            if f1_m1 < f1_m2:
-                low = m1  # The peak is in the right two-thirds
-            else:
-                high = m2 # The peak is in the left two-thirds
+            m1, m2 = low + (high - low) / 3, high - (high - low) / 3
+            f1_m1, f1_m2 = get_avg_f1(m1), get_avg_f1(m2)
+            if f1_m1 < f1_m2: low = m1
+            else: high = m2
                 
-        # The optimal threshold is now within the small [low, high] range.
-        # We can take the midpoint as our final answer.
         best_thresh = (low + high) / 2
-        best_avg_f1 = get_avg_f1(best_thresh) # One final calculation for the report
+        best_avg_f1 = get_avg_f1(best_thresh)
 
         self.log(f"--- Optimal threshold found via Ternary Search ---")
         self.log(f"  > Optimal Threshold: {best_thresh:.4f}")
@@ -1738,9 +1830,47 @@ class SalienceStudioApp(ctk.CTk):
         self.plot_training_loss(metrics) # Final plot update
         self.refresh_checkpoints()
 
+    def _save_evaluation_data_to_wav_files(self, ref_data, est_data):
+        """
+        A wrapper function that calls the main POLYPHONIC synthesizer for
+        both ground truth and estimated pitch data, and logs completion.
+        """
+        self.log("Synthesizing evaluation results to .wav files...")
+        pass #TODO: Fix/implement polyphonic synthesis for demo
+        try:
+            ref_times, ref_freqs = ref_data
+            est_times, est_freqs = est_data
+
+            # Synthesize Ground Truth
+            self.log("--- Synthesizing Ground Truth ---")
+            self.synthesize_polyphonic_from_f0(ref_times, ref_freqs, "tmp_groundtruth.wav")
+            
+            # Synthesize Model Estimation
+            self.log("--- Synthesizing Model Estimation ---")
+            self.synthesize_polyphonic_from_f0(est_times, est_freqs, "tmp_estimated.wav")
+
+            self.log("Finished synthesizing tmp_groundtruth.wav and tmp_estimated.wav.")
+
+        except Exception as e:
+            # The error log remains for debugging purposes
+            self.log(f"ERROR: Failed to save synthesized WAV files. Reason: {e}")
+
     def handle_evaluation_completion(self, data):
-        scores, ref_data, est_data = data; self.plot_evaluation_result(ref_data, est_data)
-        self.eval_button.configure(state="normal"); self.tune_button.configure(state="normal"); self.tune_single_track_button.configure(state="normal"); self.eval_progress_bar.set(0)
+        """
+        Handles the UI update after a single track evaluation is complete.
+        This now synthesizes the pitch data to MIDI and then to WAV files.
+        """
+        scores, ref_data, est_data = data
+        
+        # Call the new function to save the data
+        self._save_evaluation_data_to_wav_files(ref_data, est_data)
+        
+        # Existing functionality remains the same
+        self.plot_evaluation_result(ref_data, est_data)
+        self.eval_button.configure(state="normal")
+        self.tune_button.configure(state="normal")
+        self.tune_single_track_button.configure(state="normal")
+        self.eval_progress_bar.set(0)
 
     def handle_tuning_completion(self, data):
         best_thresh, best_f1 = data; self.threshold_entry.delete(0, 'end'); self.threshold_entry.insert(0, f"{best_thresh:.2f}")
@@ -1772,7 +1902,7 @@ class SalienceStudioApp(ctk.CTk):
     def plot_evaluation_result(self, ref_data, est_data):
         if self.eval_canvas_widget: self.eval_canvas_widget.get_tk_widget().destroy()
         ref_times, ref_freqs = ref_data; est_times, est_freqs = est_data
-        fig, ax = plt.subplots(figsize=(6, 4), facecolor="#2B2B2B")
+        fig, ax = plt.subplots(figsize=(14, 6), facecolor="#2B2B2B")
         if ref_times.size > 0: ax.scatter(ref_times, ref_freqs, c='black', marker='.', s=50, label='Reference', zorder=2)
         if est_times.size > 0: ax.scatter(est_times, est_freqs, c='#e60000', marker='.', s=25, alpha=0.9, label='Prediction', zorder=3)
         ax.set_yscale('log'); ax.set_yticks([128, 256, 512, 1024], labels=['128', '256', '512', '1024']); ax.set_ylabel('Frequency (Hz)', color='white'); ax.set_xlabel('Time (s)', color='white')
@@ -1784,7 +1914,7 @@ class SalienceStudioApp(ctk.CTk):
         """Saves a pitch estimation plot to a PDF file. Designed to be thread-safe."""
         ref_times, ref_freqs = ref_data; est_times, est_freqs = est_data
         
-        fig, ax = plt.subplots(figsize=(10, 6), facecolor="#FFFFFF") # Use white background for PDF
+        fig, ax = plt.subplots(figsize=(14, 7), facecolor="#FFFFFF") # Use white background for PDF
         
         if ref_times.size > 0: ax.scatter(ref_times, ref_freqs, c='black', marker='.', s=50, label='Reference', zorder=2)
         if est_times.size > 0: ax.scatter(est_times, est_freqs, c='#e60000', marker='.', s=25, alpha=0.7, label='Prediction', zorder=3)
