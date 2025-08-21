@@ -8,11 +8,12 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.signal import find_peaks
 import soundfile as sf
+from helpers import * 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-file = "mary.mp3"
-checkpoint_path = "candidate.pth"
-should_plot = False
+file = "lord.aac"
+checkpoint_path = "augy.pth"
+should_plot = True
 sr = 22050
 hop_length = 256
 fmin = 32.703                    # C1
@@ -20,6 +21,13 @@ harmonics = [1, 2, 3, 4, 5]
 bins_per_octave = 60
 n_octaves = 6
 n_bins = bins_per_octave * n_octaves
+
+ACTIVATIONS = {
+    "GELU": nn.GELU,
+    "GEGLU": lambda: GEGLU(),
+    "ReLU": lambda: nn.ReLU(inplace=True),
+    "SiLU": lambda: nn.SiLU(inplace=True),
+}
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -72,24 +80,50 @@ def get_new_config():
         "run_id": None,
         "data_params": {
             "sr": 22050, "hop_length": 256, "fmin": 32.703, "harmonics": [1, 2, 3, 4, 5],
-            "bins_per_octave": 60, "n_octaves": 5, "gaussian_sigma": 1.0,
+            "bins_per_octave": 60, "n_octaves": 6, "gaussian_sigma": 1.0,
             "train_dataset": "Cantoria", "eval_dataset": "DCS",
         },
         "model_params": {
-            "architecture_name": "SalienceNetV2",
+            "architecture_name": "SalienceNetV4",
             "input_channels": 5, # Should match len(harmonics)
             "layers": [
-                {"type": "conv_in", "filters": 16, "kernel": 5, "padding": 2},
-                {"type": "conv", "filters": 16, "kernel": 5, "padding": 2},
-                {"type": "conv", "filters": 16, "kernel": 5, "padding": 2},
-                {"type": "conv", "filters": 16, "kernel": 5, "padding": 2},
-                {"type": "conv", "filters": 4, "kernel": (69, 5), "padding": (34, 2)},
+                {"type": "conv_in", "filters": 32, "kernel": 5},
+                {"type": "conv", "filters": 32, "kernel": 5},
+                {"type": "conv", "filters": 32, "kernel": 5},
+                {"type": "conv", "filters": 32, "kernel": (69, 3)},
                 {"type": "conv_out", "filters": 1, "kernel": 1},
-            ], "activation": "GELU"
+            ], "activation": "GELU", "rnn_hidden_size":48,
+
+             # --- Parameters specific to the BSRoformerForSalience model ---
+            "dim": 64,               # Internal dimension of the transformer
+            "depth": 2,               # Number of axial transformer blocks
+            "heads": 4,               # Number of attention heads
+            "dim_head": 32,           # Dimension of each attention head
+            "time_transformer_depth": 1, # Layers within each time transformer
+            "freq_transformer_depth": 1, # Layers within each frequency transformer
+            "num_bands": 6,              # How many bands to split the CQT into.
+                                        # (n_bins * input_channels) must be divisible by this.
+                                        # (360 * 5) = 1800. 1800 is divisible by 6.
+
+            # --- Parameters for SpecTNTForSalience (Lite version for 6 hours of data) ---
+            "fe_out_channels": 64,          # Channels after the ResNet frontend
+            "fe_freq_pooling": (2, 2, 2),   # Downsample frequency by 2*2*2 = 8x
+            "fe_time_pooling": (2, 2, 1),   # Downsample time by 2*2*1 = 4x
+            "spectral_dmodel": 128,         # Internal dimension of spectral transformer
+            "spectral_nheads": 4,           # Attention heads
+            "spectral_dimff": 256,          # Feed-forward layer size
+            "temporal_dmodel": 128,         # Internal dimension of temporal transformer
+            "temporal_nheads": 4,           # Attention heads
+            "temporal_dimff": 256,          # Feed-forward layer size
+            "embed_dim": 128,               # Shared embedding dimension
+            "n_blocks": 4,                  # Number of SpecTNT blocks
+            "dropout": 0.1,
+            
         },
         "training_params": {
-            "learning_rate": 2e-3, "batch_size": 22, "num_epochs": 40,
-            "optimizer": "AdamW", "patch_width": 50, "patch_overlap": 0.5, "val_split_ratio": 0.1,
+            "learning_rate": 8e-4, "batch_size": 22, "num_epochs": 200,
+            "optimizer": "AdamW", "patch_width": 64, "patch_overlap": 0.5, "val_split_ratio": 0.1,
+            "weight_decay": 1e-3
         },
         "evaluation_params": {"eval_batch_size": 8, "peak_threshold": 0.3},
         "tuning_params": {
@@ -109,6 +143,112 @@ def get_new_config():
         }
     }
 
+# Import necessary components from the bsroformer git
+from bs_roformer.bs_roformer import Transformer, BandSplit, RMSNorm
+from bs_roformer.attend import Attend
+from einops import rearrange, pack, unpack, reduce
+
+class BSRoformerForSalience(nn.Module):
+    """
+    An adapter for the BS-Roformer architecture to predict salience maps from HCQT inputs.
+    """
+    def __init__(self, config):
+        super().__init__()
+        model_params = config['model_params']
+        data_params = config['data_params']
+
+        # --- BS-Roformer Specific Hyperparameters ---
+        dim = model_params.get('dim', 192)
+        depth = model_params.get('depth', 6)
+        heads = model_params.get('heads', 8)
+        dim_head = model_params.get('dim_head', 64)
+        time_transformer_depth = model_params.get('time_transformer_depth', 2)
+        freq_transformer_depth = model_params.get('freq_transformer_depth', 2)
+        num_bands = model_params.get('num_bands', 6) # How many bands to split the CQT into
+
+        # --- Input/Output Dimensions ---
+        input_channels = model_params['input_channels']
+        n_bins = data_params['n_octaves'] * data_params['bins_per_octave']
+        
+        # Validate that the CQT bins can be evenly split into the desired number of bands
+        assert (n_bins * input_channels) % num_bands == 0, f"Total features ({n_bins * input_channels}) must be divisible by the number of bands ({num_bands})."
+        
+        # --- Model Components ---
+        
+        # 1. BandSplit: This module reshapes the input and projects it into the model's dimension.
+        # It splits the flattened frequency+harmonic dimension into multiple 'bands'.
+        dims_per_band = (n_bins * input_channels) // num_bands
+        self.band_split = BandSplit(
+            dim=dim,
+            dim_inputs=tuple([dims_per_band] * num_bands)
+        )
+
+        # 2. Transformer Blocks: The core of the model, copied from the original BSRoformer.
+        self.layers = nn.ModuleList([])
+        transformer_kwargs = dict(
+            dim=dim,
+            heads=heads,
+            dim_head=dim_head,
+            flash_attn=True, # Assuming flash attention is available
+            norm_output=False
+        )
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                Transformer(depth=time_transformer_depth, **transformer_kwargs),
+                Transformer(depth=freq_transformer_depth, **transformer_kwargs)
+            ]))
+
+        # 3. Final Normalization
+        self.final_norm = RMSNorm(dim)
+
+        # 4. Salience Estimator: This replaces the original MaskEstimator.
+        # It's an MLP that projects the transformer's output to the desired salience map shape.
+        self.salience_estimator = nn.Sequential(
+            nn.Linear(dim, dim // 2),
+            nn.GELU(),
+            nn.Linear(dim // 2, n_bins), # Output one value per CQT bin
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        """
+        x: Input HCQT of shape (batch, channels, bins, time)
+        """
+        # Reshape for BS-Roformer's transformer: (b, c, f, t) -> (b, t, c*f)
+        x = x.permute(0, 3, 1, 2) # -> (b, t, c, f)
+        x = rearrange(x, 'b t c f -> b t (c f)')
+
+        # Pass through the BandSplitter to get shape (b, t, num_bands, dim)
+        x = self.band_split(x)
+
+        # Axial attention (Time and Frequency Transformers)
+        for time_transformer, freq_transformer in self.layers:
+            # Time attention
+            x = rearrange(x, 'b t f d -> b f t d')
+            x, ps = pack([x], '* t d')
+            x, _ = time_transformer(x)
+            x, = unpack(x, ps, '* t d')
+
+            # Frequency attention
+            x = rearrange(x, 'b f t d -> b t f d')
+            x, ps = pack([x], '* f d')
+            x, _ = freq_transformer(x)
+            x, = unpack(x, ps, '* f d')
+        
+        x = self.final_norm(x) # (b, t, num_bands, dim)
+
+        # Average across the bands to get a single feature vector per time step
+        x = reduce(x, 'b t num_bands d -> b t d', 'mean')
+
+        # Use the salience estimator to predict the CQT bins for each time step
+        salience_map = self.salience_estimator(x) # (b, t, n_bins)
+
+        # Reshape to the required output format: (b, t, f) -> (b, 1, f, t)
+        salience_map = rearrange(salience_map, 'b t f -> b 1 f t')
+
+        return salience_map
+
+
 class SalienceCNN(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -116,27 +256,124 @@ class SalienceCNN(nn.Module):
         layers = []
         in_channels = model_cfg['input_channels']
 
-        # Get the activation function from the dictionary
         activation_name = model_cfg.get("activation", "GELU")
-        activation_fn = nn.GELU()
+        activation_fn = ACTIVATIONS[activation_name]()
 
-        for layer_cfg in model_cfg['layers']:
-            out_channels, kernel, padding = layer_cfg['filters'], layer_cfg['kernel'], layer_cfg.get('padding', 'same')
-            layers.append(nn.Conv2d(in_channels, out_channels, kernel, padding=padding))
-            if layer_cfg['type'] != "conv_out" and layer_cfg['type'] != "conv_in":
-                layers.extend([nn.BatchNorm2d(out_channels), activation_fn])
+        for i, layer_cfg in enumerate(model_cfg['layers']):
+            out_channels = layer_cfg['filters']
+            kernel = layer_cfg['kernel']
+            padding = layer_cfg.get('padding', 'same')
+            
+            # --- THE FIX PART 2: Double channels for GEGLU ---
+            conv_out_channels = out_channels * 2 if activation_name == "GEGLU" and layer_cfg['type'] not in ["conv_out", "conv_in"] else out_channels
+
+            layers.append(nn.Conv2d(
+                in_channels=in_channels, 
+                out_channels=conv_out_channels, 
+                kernel_size=kernel, 
+                padding=padding
+            ))
+            
+            if layer_cfg['type'] not in ["conv_out", "conv_in"]:
+                # The BatchNorm must also be on the doubled channel count, *before* GEGLU halves it
+                layers.append(nn.BatchNorm2d(conv_out_channels))
+                layers.append(activation_fn)
+
             in_channels = out_channels
+        
         layers.append(nn.Sigmoid())
         self.network = nn.Sequential(*layers)
-    
-    def forward(self, x): return self.network(x)
+        
+    def forward(self, x): 
+        return self.network(x)
 
-model = SalienceCNN(get_new_config()).to(device)
+class SalienceCNNLogits(nn.Module):
+    def __init__(self, config, version=3):
+        super().__init__()
+        model_cfg = config['model_params']
+        data_cfg = config['data_params']
+        training_cfg = config['training_params']
+        layers = []
+        in_channels = len(data_cfg['harmonics'])
+
+        activation_name = model_cfg.get("activation", "GELU")
+        activation_fn = ACTIVATIONS[activation_name]()
+
+        for i, layer_cfg in enumerate(model_cfg['layers']):
+            out_channels = layer_cfg['filters']
+            kernel = layer_cfg['kernel']
+            padding = layer_cfg.get('padding', 'same')
+            
+            # --- THE FIX PART 2: Double conv output channels if using GEGLU ---
+            # This applies to intermediate layers, not the final output layer.
+            conv_out_channels = out_channels * 2 if activation_name == "GEGLU" and layer_cfg['type'] not in ["conv_out", "conv_in", "conv_n"] else out_channels
+
+            layers.append(nn.Conv2d(
+                in_channels=in_channels,
+                out_channels=conv_out_channels,
+                kernel_size=kernel,
+                padding=padding
+            ))
+
+            if layer_cfg['type'] not in ["conv_out", "conv_in", "conv_n"]:
+                # BatchNorm must operate on the doubled channels before they are halved by GEGLU
+                layers.append(nn.BatchNorm2d(conv_out_channels))
+                layers.append(activation_fn)
+            
+            # The next layer's input channel count is the *halved* count after GEGLU
+            in_channels = out_channels
+
+        self.network = nn.Sequential(*layers)
+        
+        # This dynamic calculation logic remains the same
+        with torch.no_grad():
+            dummy_input = torch.randn(1, len(data_cfg['harmonics']), data_cfg['bins_per_octave'] * data_cfg['n_octaves'], training_cfg['patch_width'])
+            if version == 4:
+                cnn_feature_extractor = self.network
+            else:
+                cnn_feature_extractor = self.network
+            cnn_out_shape = cnn_feature_extractor(dummy_input).shape
+            self.gru_input_size = cnn_out_shape[1] * cnn_out_shape[2]
+
+        self.gru = None
+        self.linear_out = None
+        if version == 4:
+            # GRU setup logic...
+            self.gru = nn.GRU(
+                input_size=self.gru_input_size,
+                hidden_size=model_cfg['rnn_hidden_size'],
+                num_layers=1, bidirectional=False, batch_first=True
+            )
+            self.linear_out = nn.Linear(model_cfg['rnn_hidden_size'], data_cfg['bins_per_octave'] * data_cfg['n_octaves'])
+
+    def forward(self, x):
+        # Forward pass logic...
+        x = self.network(x)
+        if self.gru:
+            x = x.permute(0, 3, 1, 2)
+            N, W, C, H = x.shape
+            x = x.reshape(N, W, C * H)
+            x, _ = self.gru(x)
+            x = self.linear_out(x)
+            x = x.permute(0, 2, 1).unsqueeze(1)
+        return x
+
+model = SalienceCNNLogits(get_new_config(), version=3).to(device)
+# model = BSRoformerForSalience(get_new_config()).to(device)
 
 # Load your checkpoint and pull out just the weights
 checkpoint = torch.load(checkpoint_path, map_location=device)
-model.load_state_dict(checkpoint)
-# checkpoint = torch.load(checkpoint_path, map_location=device)
+try:
+    ch = checkpoint['model_state_dict']
+except:
+    ch = checkpoint
+
+from collections import OrderedDict
+new_state_dict = OrderedDict()
+for k, v in ch.items():
+    name = k.replace('_orig_mod.', '') # remove `_orig_mod.`
+    new_state_dict[name] = v
+model.load_state_dict(new_state_dict)
 # model.load_state_dict(checkpoint['model_state_dict'])
 
 model.eval()
@@ -158,7 +395,7 @@ def compute_hcqt(audio_fpath):
                   np.abs(np.stack(cqt_list)), ref=np.max) + 1.0
     return log_hcqt
 
-def create_patches(hcqt_mag, patch_width=50):
+def create_patches(hcqt_mag, patch_width=64):
     n_ch, n_b, n_f = hcqt_mag.shape
     step = patch_width // 2
     patches = []
@@ -198,7 +435,7 @@ ov_count = np.zeros_like(out_map)
 with torch.no_grad():
     for batch_idx, batch in enumerate(tqdm(loader, desc="Inference")):
         batch = batch.to(device)            # (B, H, F, W)
-        preds = model(batch).squeeze(1)     # (B, F, W)
+        preds = torch.sigmoid(model(batch).squeeze(1))     # (B, F, W)
         preds = preds.cpu().numpy()
         for j, p in enumerate(preds):
             start = batch_idx*loader.batch_size*step + j*step
@@ -254,7 +491,7 @@ def synthesize_polyphonic_with_debug(
     def _quantize_to_semitone(f):
         return _midi_to_freq_vectorized(np.round(_freq_to_midi_vectorized(f)))
     
-    def _merge_same_pitch_notes(notes, merge_gap_ms=500.0, midi_tol=0):
+    def _merge_same_pitch_notes(notes, merge_gap_ms=200.0, midi_tol=0):
         """
         Merge adjacent same-pitch notes if the gap between them is <= merge_gap_ms.
         Pitch equality is tested by MIDI (rounded), with optional tolerance in semitones.
@@ -303,27 +540,17 @@ def synthesize_polyphonic_with_debug(
 
 
     def _smooth_f0_contour(times_, freqs_, sr,
-                       smooth_ms=20.0,
-                       gap_factor=1.5,
-                       hold_ms=1000.0,
-                       semitone_tol=0.5,
-                       bridge='hold'):
+                       smooth_ms=30.0,  # Note: This is now the median filter window size
+                       gap_factor=1.0,
+                       hold_ms=150.0,
+                       semitone_tol=0.1,
+                       bridge='interp'):
         """
         Dense smoothing for a SINGLE voice contour (sparse -> dense) with:
         • explicit unvoiced gaps (zeros), and
         • optional 'hold' bridging across short gaps (≤ hold_ms) if the next note
             is within ±semitone_tol semitones of the current note.
-
-        Args:
-            times_, freqs_: sparse detections for one voice
-            sr:        sample rate for dense timeline
-            smooth_ms: one-pole low-pass time constant (per voiced segment)
-            gap_factor: gap is "large" if > gap_factor * median_frame_dt
-            hold_ms:   max gap to bridge (milliseconds)
-            semitone_tol: tolerance in semitones for pitch continuity
-            bridge:    'hold' (flat) or 'interp' (linear glide) across bridged gap
-        Returns:
-            t_dense (s), f0_dense (Hz) with zeros in true unvoiced regions.
+        • Jitter removal via a median filter, which preserves sharp note onsets.
         """
         import numpy as np
         from scipy import signal
@@ -353,11 +580,8 @@ def synthesize_polyphonic_with_debug(
         hold_thr = hold_ms / 1000.0
         cents = lambda f2, f1: 1200.0 * np.log2(max(f2, 1e-9) / max(f1, 1e-9))
 
-        # Build augmented anchors
-        t_aug = []
-        f_aug = []
-
-        # Leading zero anchor
+        # Build augmented anchors for interpolation
+        t_aug, f_aug = [], []
         t0 = max(0.0, times_[0] - 0.5 * dt_med)
         t_aug.append(t0); f_aug.append(0.0)
 
@@ -370,66 +594,46 @@ def synthesize_polyphonic_with_debug(
                 gap = t_next - t_i
 
                 if gap > gap_thr:
-                    # Candidate for bridging?
                     same_pitch = (f_i > 0 and f_next > 0 and
                                 abs(cents(f_next, f_i)) <= semitone_tol * 100.0)
                     if gap <= hold_thr and same_pitch:
-                        # BRIDGE the gap
                         if bridge == 'hold':
-                            # Flat hold of previous pitch until just before next
                             tL = t_i + 0.5 * dt_med
                             tR = t_next - 0.5 * dt_med
                             if tR > tL:
                                 t_aug += [tL, tR]; f_aug += [f_i, f_i]
-                        elif bridge == 'interp':
-                            # Linear glide: no zeros; optional mid-anchor to stabilize
-                            # (Leaving only endpoints will already interpolate linearly.)
-                            pass
                     else:
-                        # REAL silence: drop to zero inside the gap
                         tL = t_i + 0.5 * dt_med
                         tR = t_next - 0.5 * dt_med
                         if tR > tL:
                             t_aug += [tL, tR]; f_aug += [0.0, 0.0]
 
-        # Trailing zero anchor
         tN = times_[-1] + 0.5 * dt_med
         t_aug.append(tN); f_aug.append(0.0)
 
         t_aug = np.asarray(t_aug, float)
         f_aug = np.asarray(f_aug, float)
 
-        # Dense timeline
+        # Dense timeline and interpolation
         T = float(max(t_aug.max(), times_.max()) + 0.25)
         N = int(np.ceil(T * sr))
         t_dense = np.arange(N) / sr
-
-        # Interpolate; zeros persist where we placed 0-Hz anchors
         f0 = np.interp(t_dense, t_aug, f_aug, left=0.0, right=0.0)
 
-        # Smooth ONLY within voiced segments
+        # --- REVISED SMOOTHING LOGIC ---
+        # Use a median filter to remove jitter without creating onset/offset ramps.
         if smooth_ms and smooth_ms > 0:
-            fc = 1.0 / (smooth_ms / 1000.0)
-            w = 2 * np.pi * fc / sr
-            alpha = w / (1 + w)
-            b, a = np.array([alpha]), np.array([1.0, -(1.0 - alpha)])
-
-            voiced = f0 > 0.0
-            v = voiced.astype(np.int8)
-            dv = np.diff(v, prepend=0, append=0)
-            starts = np.where(dv == 1)[0]
-            ends   = np.where(dv == -1)[0]
-
-            f0_s = f0.copy()
-            for s, e in zip(starts, ends):
-                if e > s:
-                    f0_s[s:e] = signal.lfilter(b, a, f0[s:e])
-            f0 = f0_s
+            # Convert window size from milliseconds to an odd number of samples
+            kernel_size = int(smooth_ms / 1000.0 * sr)
+            if kernel_size > 1:
+                if kernel_size % 2 == 0:
+                    kernel_size += 1  # Ensure kernel size is odd
+                f0 = signal.medfilt(f0, kernel_size=kernel_size)
 
         return t_dense, f0.astype(float)
 
 
-    def _segment_notes(t_dense, f0_q, sr, min_duration_ms=80.0):
+    def _segment_notes(t_dense, f0_q, sr, min_duration_ms=10.0):
         stable, start = [], -1
         min_len = int((min_duration_ms/1000.0) * sr)
         for i in range(1, len(f0_q)):
@@ -721,8 +925,8 @@ def extract_multi_f0_stream(
 
 
 synth_sr = 16000          # synthesis sample rate (you can change if you like)
-peak_thresh = 0.55         # detection threshold (tune as desired)
-max_voices = 8
+peak_thresh = 0.5         # detection threshold (tune as desired)
+max_voices = 4
 
 # 1) Build the refined peak stream from your salience map:
 times_f0, freqs_f0 = extract_multi_f0_stream(

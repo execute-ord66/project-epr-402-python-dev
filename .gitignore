@@ -1,5 +1,6 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+.vscode/
 *.py[cod]
 *$py.class
 *_test.*
@@ -8,6 +9,7 @@ test?.wav
 checkpoints/
 *.wav
 *.mp3
+*.aac
 tmp_*
 *.pth
 *.mid
