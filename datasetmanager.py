@@ -13,7 +13,12 @@ from torch.utils.data import DataLoader, Dataset
 # Local imports from your other files
 from augmentations import SalienceAugment
 from dataprocessor import *
-from datasets.dynamic_mixing import DynamicMixingDataset
+# The previous training loader relied on ``DynamicMixingDataset`` which used a
+# complex ``FileCache`` for storing pre-processed audio.  This proved to be
+# slow and memory hungry.  We now use ``AugmentedSalienceDataset`` which
+# performs lightweight on-the-fly loading and augmentation inspired by the
+# efficient pipeline in ZFTurbo's codebase.
+from datasets.augmentation_dataset import AugmentedSalienceDataset
 
 
 def NOOP_LOG(*args, **kwargs):
@@ -487,7 +492,7 @@ class DatasetManager:
                     worker_init_fn=_worker_init_fn,
                 )
 
-        # ---------------- Training (DynamicMixingDataset) ----------------
+        # ---------------- Training (on-the-fly augmented dataset) ----------------
         if not train_groups:
             self.log("ERROR: No training groups found in the split.")
             return None, val_loader
@@ -504,10 +509,10 @@ class DatasetManager:
             return None, val_loader
 
         self.log(
-            f"Creating dynamic training loader with {len(train_stems_with_info)} stems."
+            f"Creating training loader with {len(train_stems_with_info)} stems using on-the-fly augmentation."
         )
 
-        train_dataset = DynamicMixingDataset(
+        train_dataset = AugmentedSalienceDataset(
             train_stems_with_info, config, log_callback=print
         )
 
