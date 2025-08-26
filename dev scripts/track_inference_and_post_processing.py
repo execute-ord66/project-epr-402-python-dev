@@ -8,11 +8,11 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.signal import find_peaks
 import soundfile as sf
-from helpers import * 
+# from helpers import * 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-file = "lord.aac"
-checkpoint_path = "augy.pth"
+file = "./test_tracks/lord.aac"
+checkpoint_path = "./tested_models/cpu_nono.pth"
 should_plot = True
 sr = 22050
 hop_length = 256
@@ -90,7 +90,7 @@ def get_new_config():
                 {"type": "conv_in", "filters": 32, "kernel": 5},
                 {"type": "conv", "filters": 32, "kernel": 5},
                 {"type": "conv", "filters": 32, "kernel": 5},
-                {"type": "conv", "filters": 32, "kernel": (69, 3)},
+                {"type": "conv", "filters": 32, "kernel": (69, 1)},
                 {"type": "conv_out", "filters": 1, "kernel": 1},
             ], "activation": "GELU", "rnn_hidden_size":48,
 

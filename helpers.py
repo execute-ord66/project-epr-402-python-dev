@@ -1,44 +1,44 @@
-import numpy as np
-from numba import njit, prange
-
-@njit(cache=True, fastmath=True)
-def rasterize_f0_lines(bin_pos, active_mask, SS_F, SS_T, n_bins, n_frames, f0_map_hi):
-    hi_n_bins = n_bins * SS_F
-    for t0 in range(n_frames - 1):
-        a0 = 1.0 if active_mask[t0] else 0.0
-        a1 = 1.0 if active_mask[t0 + 1] else 0.0
-        if (a0 + a1) == 0.0:
-            continue
-        b0 = bin_pos[t0]
-        b1 = bin_pos[t0 + 1]
-        hi_t_start = t0 * SS_T
-        for hi_t in range(hi_t_start, hi_t_start + SS_T):
-            u = (hi_t - hi_t_start) / float(SS_T)
-            act = (1.0 - u) * a0 + u * a1
-            if act <= 0.5:
-                continue
-            b = b0 + u * (b1 - b0)
-            hi_b = int(round(b * SS_F))
-            if 0 <= hi_b < hi_n_bins:
-                f0_map_hi[hi_b, hi_t] = 1.0
-
-@njit(cache=True, fastmath=True, parallel=True)
-def normalize_peaks_inplace(f0_map):
-    F, T = f0_map.shape
-    for t in prange(T):
-        for p in range(1, F-1):
-            val = f0_map[p, t]
-            if p < 30:
-                continue
-
-            if val > 0.0 and val > f0_map[p-1, t] and val > f0_map[p+1, t]:
-                inv = 1.0 / val
-                v0 = f0_map[p-1, t] * inv; f0_map[p-1, t] = 1.0 if v0 > 1.0 else v0
-                v1 = f0_map[p,   t] * inv; f0_map[p,   t] = 1.0 if v1 > 1.0 else v1
-                v2 = f0_map[p+1, t] * inv; f0_map[p+1, t] = 1.0 if v2 > 1.0 else v2
-
+# helpers.py
 import torch.nn.functional as F
 import torch.nn as nn
+import torch.distributions as dist
+import torch
+
+def mixup_data(x, y, alpha=0.4):
+    """
+    Applies mixup augmentation to a batch of data directly on the GPU.
+
+    Args:
+        x (torch.Tensor): The input batch (e.g., CQTs) on the target device.
+        y (torch.Tensor): The target batch (e.g., salience maps) on the target device.
+        alpha (float): The alpha parameter for the Beta distribution. If 0, no mixup.
+
+    Returns:
+        (torch.Tensor, torch.Tensor): The mixed input and target batches.
+    """
+    if alpha <= 0:
+        return x, y
+
+    # Get the device from the input tensor.
+    device = x.device
+    batch_size = x.size(0)
+
+    # Create the Beta distribution object.
+    beta_distribution = dist.Beta(torch.tensor([alpha], device=device), 
+                                  torch.tensor([alpha], device=device))
+    
+    # Sample a single mixing coefficient directly on the GPU.
+    lam = beta_distribution.sample()
+
+    # Generate a random permutation of indices.
+    index = torch.randperm(batch_size, device=device)
+
+    # Mix the original batch with the shuffled batch.
+    # This is now a pure GPU operation.
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    mixed_y = lam * y + (1 - lam) * y[index, :]
+    
+    return mixed_x, mixed_y
 
 class GEGLU(nn.Module):
     """
